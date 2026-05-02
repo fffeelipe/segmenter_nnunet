@@ -1,22 +1,24 @@
 #!/usr/bin/env python3
-"""Build Dataset503_ALT_T1T2: a 2-channel (T1 + T2 on T1 grid) nnU-Net v2 dataset.
+"""Build Dataset503_ALT_T1T2: a 2-channel (T1 + T2 on a common reference grid) nnU-Net v2 dataset.
 
 For each patient that has both T1/ and T2/ folders in the repo root:
 
-1. Read T1 image, apply intensity fix, use it as the reference grid.
-2. Read T1 label, align to T1 image grid.
-3. Read T2 image, apply intensity fix, resample onto T1 grid (linear).
-4. Read T2 label, align to T2 image grid, resample onto T1 grid (nearest).
+1. Read T1/T2 images, apply intensity fixes.
+2. Build a per-case common reference grid (isotropic, intersection-FOV).
+3. Resample both images onto the common grid (linear).
+4. Align each label to its modality image grid, then resample both labels onto
+   the common grid (nearest).
 5. Fuse the two masks (union by default) into a single binary GT.
 
 Output layout (under ``nnUNet_raw``):
 
     Dataset503_ALT_T1T2/
-        imagesTr/IOGxx_0000.nii.gz    # T1
-        imagesTr/IOGxx_0001.nii.gz    # T2 resampled onto T1 grid
+        imagesTr/IOGxx_0000.nii.gz    # T1 resampled onto common grid
+        imagesTr/IOGxx_0001.nii.gz    # T2 resampled onto common grid
         labelsTr/IOGxx.nii.gz         # fused binary mask {0, 1}
         dataset.json
         fusion_report.json            # per-case QC metrics
+        holdout/images|labels/        # optional: ``--exclude-cases-file`` (patient IOGxx)
 
 Reuses helpers from :mod:`convert_to_nnunet` (``_fix_intensity``,
 ``_prebinarize``, ``align_label_to_image``, ``find_pair``,
@@ -28,11 +30,13 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import subprocess
 import sys
 from pathlib import Path
 
 import numpy as np
 import SimpleITK as sitk
+from concurrent.futures import ProcessPoolExecutor, as_completed
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from convert_to_nnunet import (  # noqa: E402
@@ -43,11 +47,165 @@ from convert_to_nnunet import (  # noqa: E402
     _prebinarize,
     align_label_to_image,
     find_pair,
+    load_exclude_case_ids,
 )
 
 
 DATASET_NAME = "Dataset503_ALT_T1T2"
 FUSION_MODES = ("union", "intersection", "staple")
+FOV_POLICY = "intersection"
+
+
+def _guess_physical_cores() -> int:
+    """Best-effort estimate of physical core count (Linux), else fallback."""
+    try:
+        out = subprocess.check_output(["lscpu", "-p=Core,Socket"], text=True)
+        cores = set()
+        for line in out.splitlines():
+            if not line or line.startswith("#"):
+                continue
+            core, sock = line.split(",")[:2]
+            cores.add((core.strip(), sock.strip()))
+        if cores:
+            return int(len(cores))
+    except Exception:
+        pass
+    return int(os.cpu_count() or 1)
+
+
+def _default_workers() -> int:
+    phys = max(1, _guess_physical_cores())
+    return max(1, phys // 2)
+
+
+def _tmp_path(final_path: Path) -> Path:
+    # Same directory for atomic os.replace; include PID to avoid collisions.
+    # IMPORTANT: keep a recognized suffix (e.g. .nii.gz) so SimpleITK can pick an ImageIO.
+    name = final_path.name
+    pid = os.getpid()
+    if name.endswith(".nii.gz"):
+        return final_path.with_name(name[:-7] + f".tmp.{pid}.nii.gz")
+    if name.endswith(".nii"):
+        return final_path.with_name(name[:-4] + f".tmp.{pid}.nii")
+    # Fallback: preserve suffix if present.
+    return final_path.with_name(name + f".tmp.{pid}{final_path.suffix}")
+
+
+def _write_sitk_atomic(img: sitk.Image, final_path: Path) -> None:
+    tmp = _tmp_path(final_path)
+    try:
+        sitk.WriteImage(img, str(tmp))
+        os.replace(str(tmp), str(final_path))
+    finally:
+        try:
+            if tmp.exists():
+                tmp.unlink()
+        except Exception:
+            # Best-effort cleanup only; atomicity is handled by os.replace.
+            pass
+
+
+def _write_label_atomic(
+    arr: np.ndarray, reference_img: sitk.Image, final_path: Path, pixel_type
+) -> None:
+    tmp = _tmp_path(final_path)
+    try:
+        out = sitk.GetImageFromArray(arr)
+        out.CopyInformation(reference_img)
+        out = sitk.Cast(out, pixel_type)
+        sitk.WriteImage(out, str(tmp))
+        os.replace(str(tmp), str(final_path))
+    finally:
+        try:
+            if tmp.exists():
+                tmp.unlink()
+        except Exception:
+            pass
+
+
+def _min_isotropic_spacing(a: sitk.Image, b: sitk.Image) -> float:
+    """Pick isotropic spacing = min of both images' spacings (across all axes)."""
+    sa = np.asarray(a.GetSpacing(), dtype=float)
+    sb = np.asarray(b.GetSpacing(), dtype=float)
+    s = float(np.min(np.concatenate([sa, sb])))
+    if not np.isfinite(s) or s <= 0:
+        raise ValueError(f"Invalid spacing encountered (min spacing={s}).")
+    return s
+
+
+def _image_corners_physical(img: sitk.Image) -> list[tuple[float, float, float]]:
+    """Return the 8 corner points of img in physical space."""
+    size = img.GetSize()
+    if len(size) != 3:
+        raise ValueError(f"Expected 3D image, got size={size}")
+    max_idx = (size[0] - 1, size[1] - 1, size[2] - 1)
+    corners = []
+    for ix in (0, max_idx[0]):
+        for iy in (0, max_idx[1]):
+            for iz in (0, max_idx[2]):
+                corners.append(tuple(img.TransformIndexToPhysicalPoint((ix, iy, iz))))
+    return corners
+
+
+def _bounds_in_reference_index_space(
+    reference_img: sitk.Image, moving_img: sitk.Image
+) -> tuple[np.ndarray, np.ndarray]:
+    """Axis-aligned bounds of moving_img expressed in reference index space.
+
+    We transform the moving image's physical corners into the reference image's
+    continuous index coordinates, then take min/max per axis.
+    """
+    pts = _image_corners_physical(moving_img)
+    idxs = np.asarray(
+        [reference_img.TransformPhysicalPointToContinuousIndex(p) for p in pts],
+        dtype=float,
+    )
+    mins = np.min(idxs, axis=0)
+    maxs = np.max(idxs, axis=0)
+    return mins, maxs
+
+
+def _build_reference_grid_intersection_isotropic(
+    t1_img: sitk.Image, t2_img: sitk.Image
+) -> tuple[sitk.Image | None, dict]:
+    """Create a per-case reference grid: isotropic spacing, intersection-FOV.
+
+    Output grid uses T1 direction as axes. The FOV is the intersection of the two
+    images' physical extents expressed in that coordinate frame (so no padding).
+    """
+    iso = _min_isotropic_spacing(t1_img, t2_img)
+    t1_spacing = np.asarray(t1_img.GetSpacing(), dtype=float)
+
+    t1_mins, t1_maxs = _bounds_in_reference_index_space(t1_img, t1_img)
+    t2_mins, t2_maxs = _bounds_in_reference_index_space(t1_img, t2_img)
+    inter_mins = np.maximum(t1_mins, t2_mins)
+    inter_maxs = np.minimum(t1_maxs, t2_maxs)
+
+    # Continuous-index extent in T1 voxel units.
+    extent_idx = inter_maxs - inter_mins
+    if np.any(~np.isfinite(extent_idx)) or np.any(extent_idx <= 0):
+        return None, {
+            "ok": False,
+            "reason": "empty_intersection_fov",
+            "iso_spacing": round(float(iso), 6),
+        }
+
+    extent_mm = extent_idx * t1_spacing
+    out_spacing = np.asarray([iso, iso, iso], dtype=float)
+    out_size = np.maximum(1, np.ceil(extent_mm / out_spacing)).astype(int)
+
+    out = sitk.Image([int(x) for x in out_size.tolist()], sitk.sitkFloat32)
+    out.SetSpacing(tuple(float(x) for x in out_spacing.tolist()))
+    out.SetDirection(t1_img.GetDirection())
+    out.SetOrigin(tuple(t1_img.TransformContinuousIndexToPhysicalPoint(tuple(float(x) for x in inter_mins))))
+    return out, {
+        "ok": True,
+        "reason": "ok",
+        "iso_spacing": round(float(iso), 6),
+        "fov_policy": FOV_POLICY,
+        "ref_size": [int(x) for x in out_size.tolist()],
+        "ref_spacing": [round(float(x), 6) for x in out_spacing.tolist()],
+    }
 
 
 def _resample_image_to(reference_img: sitk.Image, moving_img: sitk.Image) -> sitk.Image:
@@ -105,10 +263,7 @@ def _fuse(t1_mask: np.ndarray, t2_on_t1_mask: np.ndarray, mode: str) -> np.ndarr
 def _save_image_like_reference(
     arr: np.ndarray, reference_img: sitk.Image, out_path: Path, pixel_type
 ) -> None:
-    out = sitk.GetImageFromArray(arr)
-    out.CopyInformation(reference_img)
-    out = sitk.Cast(out, pixel_type)
-    sitk.WriteImage(out, str(out_path))
+    _write_label_atomic(arr, reference_img, out_path, pixel_type)
 
 
 def _zeros_like(reference_img: sitk.Image) -> sitk.Image:
@@ -118,6 +273,45 @@ def _zeros_like(reference_img: sitk.Image) -> sitk.Image:
     out.SetOrigin(reference_img.GetOrigin())
     out.SetDirection(reference_img.GetDirection())
     return out
+
+
+def _build_and_write_one_case(
+    case_id: str,
+    case_dir_t1: str,
+    case_dir_t2: str,
+    images_dir: str,
+    labels_dir: str,
+    *,
+    fusion_mode: str,
+    strict: bool,
+) -> dict:
+    """Worker entrypoint: build one patient and write outputs for its samples."""
+    result = build_case(
+        Path(case_dir_t1),
+        Path(case_dir_t2),
+        fusion_mode=fusion_mode,
+        strict=strict,
+    )
+    if result is None:
+        return {"case_id": case_id, "mode": "skipped", "report": None, "n_written": 0}
+
+    report = result["report"]
+    samples = result["samples"]
+
+    images_dir_p = Path(images_dir)
+    labels_dir_p = Path(labels_dir)
+
+    n_written = 0
+    for s in samples:
+        out_id = s["case_id"]
+        _write_sitk_atomic(s["ch0"], images_dir_p / f"{out_id}_0000.nii.gz")
+        _write_sitk_atomic(s["ch1"], images_dir_p / f"{out_id}_0001.nii.gz")
+        _save_image_like_reference(
+            s["mask_arr"], s["mask_ref"], labels_dir_p / f"{out_id}.nii.gz", sitk.sitkUInt8
+        )
+        n_written += 1
+
+    return {"case_id": case_id, "mode": report.get("mode"), "report": report, "n_written": n_written}
 
 
 def build_case(
@@ -165,12 +359,13 @@ def build_case(
     direction_mismatch = not _direction_matches(t1_img, t2_img_native)
     same_grid, _reason = _geom_matches(t1_img, t2_img_native, tol=GEOM_TOL)
 
-    t1_arr = sitk.GetArrayFromImage(t1_lbl).astype(bool)
+    t1_native_arr = sitk.GetArrayFromImage(t1_lbl).astype(bool)
     t2_native_arr = sitk.GetArrayFromImage(t2_lbl_on_t2).astype(bool)
 
-    # Strategy for direction-mismatch: do not create a misregistered 2-channel sample.
-    # Instead, emit two derived single-modality samples (with a blank other channel).
-    if direction_mismatch:
+    # Build per-case common grid (intersection-FOV, isotropic min spacing).
+    ref_img, ref_meta = _build_reference_grid_intersection_isotropic(t1_img, t2_img_native)
+    if ref_img is None:
+        # Cannot form a meaningful shared FOV. Direction mismatch or not, emit split samples.
         derived_t1 = f"{case_id}_T1"
         derived_t2 = f"{case_id}_T2"
         report = {
@@ -178,10 +373,18 @@ def build_case(
             "mode": "split_mismatch",
             "fusion_mode": fusion_mode,
             "derived_cases": [derived_t1, derived_t2],
-            "direction_mismatch": True,
+            "direction_mismatch": direction_mismatch,
             "same_grid": same_grid,
-            "t1_fg": int(t1_arr.sum()),
+            "join_attempted": False,
+            "join_qc_passed": False,
+            "join_fail_reason": ref_meta.get("reason"),
+            "ref": ref_meta,
+            # Legacy fields used by inspect_fusion.py and old logs:
+            "t1_fg": int(t1_native_arr.sum()),
             "t2_fg_native": int(t2_native_arr.sum()),
+            "t2_fg_on_t1": None,
+            "retained": None,
+            "t1_fg_native": int(t1_native_arr.sum()),
             "t1_size": list(t1_img.GetSize()),
             "t2_size": list(t2_img_native.GetSize()),
             "t1_spacing": [round(s, 4) for s in t1_img.GetSpacing()],
@@ -195,7 +398,7 @@ def build_case(
                     "case_id": derived_t1,
                     "ch0": t1_img,
                     "ch1": _zeros_like(t1_img),
-                    "mask_arr": t1_arr.astype(np.uint8),
+                    "mask_arr": t1_native_arr.astype(np.uint8),
                     "mask_ref": t1_img,
                 },
                 {
@@ -208,47 +411,127 @@ def build_case(
             ],
         }
 
-    # Aligned strategy: resample T2 onto T1 grid and fuse masks.
-    t2_img_on_t1 = _resample_image_to(t1_img, t2_img_native)
-    t2_lbl_on_t1 = _resample_mask_to(t1_img, t2_lbl_on_t2)
-    t2_on_t1_arr = sitk.GetArrayFromImage(t2_lbl_on_t1).astype(bool)
+    # Attempt join: resample both modalities + both labels onto the common grid.
+    t1_img_on_ref = _resample_image_to(ref_img, t1_img)
+    t2_img_on_ref = _resample_image_to(ref_img, t2_img_native)
+    t1_lbl_on_ref = _resample_mask_to(ref_img, t1_lbl)
+    t2_lbl_on_ref = _resample_mask_to(ref_img, t2_lbl_on_t2)
 
-    t2_fg_native = int(t2_native_arr.sum())
-    t2_fg_on_t1 = int(t2_on_t1_arr.sum())
-    if t2_fg_native == 0:
-        retained = float("nan")
-    else:
-        retained = t2_fg_on_t1 / t2_fg_native
+    t1_on_ref_arr = sitk.GetArrayFromImage(t1_lbl_on_ref).astype(bool)
+    t2_on_ref_arr = sitk.GetArrayFromImage(t2_lbl_on_ref).astype(bool)
 
-    retained_ok = np.isnan(retained) or retained >= MIN_FOREGROUND_RETAINED
+    def _retained(native: np.ndarray, on_ref: np.ndarray) -> float:
+        n0 = int(native.sum())
+        n1 = int(on_ref.sum())
+        if n0 == 0:
+            return float("nan")
+        return n1 / n0
+
+    t1_retained = _retained(t1_native_arr, t1_on_ref_arr)
+    t2_retained = _retained(t2_native_arr, t2_on_ref_arr)
+    dice_raters = _dice(t1_on_ref_arr, t2_on_ref_arr)
+
+    retained_ok = (
+        (np.isnan(t1_retained) or t1_retained >= MIN_FOREGROUND_RETAINED)
+        and (np.isnan(t2_retained) or t2_retained >= MIN_FOREGROUND_RETAINED)
+    )
+
+    qc_ok = retained_ok
+    qc_reason = None
     if not retained_ok:
-        msg = (
-            f"[{case_id}] T2 label lost too much foreground after resampling "
-            f"onto T1 grid ({t2_fg_native} -> {t2_fg_on_t1}, "
-            f"retained {retained:.0%}, threshold "
-            f"{MIN_FOREGROUND_RETAINED:.0%})."
-        )
-        if strict:
-            raise ValueError(msg)
-        print(f"WARNING: {msg} case skipped")
-        return None
+        qc_reason = "foreground_lost_on_resample"
 
-    fused_arr = _fuse(t1_arr, t2_on_t1_arr, fusion_mode)
+    # Under direction mismatch, require an extra plausibility check: non-trivial agreement.
+    # (Many real cases can have low Dice, so we keep this conservative and rely primarily on retention.)
+    if direction_mismatch and qc_ok:
+        if np.isnan(dice_raters) or dice_raters == 0.0:
+            qc_ok = False
+            qc_reason = "direction_mismatch_and_zero_dice"
+
+    if not qc_ok:
+        msg = (
+            f"[{case_id}] join QC failed on common grid (reason={qc_reason}, "
+            f"t1_retained={t1_retained:.3f}, t2_retained={t2_retained:.3f}, "
+            f"dice={dice_raters:.3f} dir_mismatch={direction_mismatch})."
+        )
+        if strict and (qc_reason == "foreground_lost_on_resample"):
+            raise ValueError(msg)
+        print(f"WARNING: {msg} falling back to split samples")
+
+        derived_t1 = f"{case_id}_T1"
+        derived_t2 = f"{case_id}_T2"
+        report = {
+            "case_id": case_id,
+            "mode": "split_mismatch",
+            "fusion_mode": fusion_mode,
+            "derived_cases": [derived_t1, derived_t2],
+            "direction_mismatch": direction_mismatch,
+            "same_grid": same_grid,
+            "join_attempted": True,
+            "join_qc_passed": False,
+            "join_fail_reason": qc_reason,
+            "ref": ref_meta,
+            # Legacy fields used by inspect_fusion.py and old logs:
+            "t1_fg": int(t1_native_arr.sum()),
+            "t2_fg_native": int(t2_native_arr.sum()),
+            "t2_fg_on_t1": int(t2_on_ref_arr.sum()),
+            "retained": None if np.isnan(t2_retained) else round(float(t2_retained), 4),
+            "t1_fg_native": int(t1_native_arr.sum()),
+            "t1_fg_on_ref": int(t1_on_ref_arr.sum()),
+            "t2_fg_on_ref": int(t2_on_ref_arr.sum()),
+            "t1_retained": None if np.isnan(t1_retained) else round(float(t1_retained), 4),
+            "t2_retained": None if np.isnan(t2_retained) else round(float(t2_retained), 4),
+            "dice_raters_on_ref": None if np.isnan(dice_raters) else round(float(dice_raters), 4),
+            "t1_size": list(t1_img.GetSize()),
+            "t2_size": list(t2_img_native.GetSize()),
+            "t1_spacing": [round(s, 4) for s in t1_img.GetSpacing()],
+            "t2_spacing": [round(s, 4) for s in t2_img_native.GetSpacing()],
+        }
+        return {
+            "mode": "split_mismatch",
+            "report": report,
+            "samples": [
+                {
+                    "case_id": derived_t1,
+                    "ch0": t1_img,
+                    "ch1": _zeros_like(t1_img),
+                    "mask_arr": t1_native_arr.astype(np.uint8),
+                    "mask_ref": t1_img,
+                },
+                {
+                    "case_id": derived_t2,
+                    "ch0": _zeros_like(t2_img_native),
+                    "ch1": t2_img_native,
+                    "mask_arr": t2_native_arr.astype(np.uint8),
+                    "mask_ref": t2_img_native,
+                },
+            ],
+        }
+
+    fused_arr = _fuse(t1_on_ref_arr, t2_on_ref_arr, fusion_mode)
 
     report = {
         "case_id": case_id,
         "mode": "aligned",
         "fusion_mode": fusion_mode,
         "derived_cases": [case_id],
-        "direction_mismatch": False,
+        "direction_mismatch": direction_mismatch,
         "same_grid": same_grid,
-        "t1_fg": int(t1_arr.sum()),
-        "t2_fg_native": t2_fg_native,
-        "t2_fg_on_t1": t2_fg_on_t1,
-        "retained": None if np.isnan(retained) else round(retained, 4),
-        "dice_raters": round(_dice(t1_arr, t2_on_t1_arr), 4)
-        if not np.isnan(_dice(t1_arr, t2_on_t1_arr))
-        else None,
+        "join_attempted": True,
+        "join_qc_passed": True,
+        "join_fail_reason": None,
+        "ref": ref_meta,
+        # Legacy fields used by inspect_fusion.py and old logs:
+        "t1_fg": int(t1_on_ref_arr.sum()),
+        "t2_fg_on_t1": int(t2_on_ref_arr.sum()),
+        "retained": None if np.isnan(t2_retained) else round(float(t2_retained), 4),
+        "t1_fg_native": int(t1_native_arr.sum()),
+        "t2_fg_native": int(t2_native_arr.sum()),
+        "t1_fg_on_ref": int(t1_on_ref_arr.sum()),
+        "t2_fg_on_ref": int(t2_on_ref_arr.sum()),
+        "t1_retained": None if np.isnan(t1_retained) else round(float(t1_retained), 4),
+        "t2_retained": None if np.isnan(t2_retained) else round(float(t2_retained), 4),
+        "dice_raters": None if np.isnan(dice_raters) else round(float(dice_raters), 4),
         "fused_fg": int(fused_arr.sum()),
         "t1_size": list(t1_img.GetSize()),
         "t2_size": list(t2_img_native.GetSize()),
@@ -262,10 +545,10 @@ def build_case(
         "samples": [
             {
                 "case_id": case_id,
-                "ch0": t1_img,
-                "ch1": t2_img_on_t1,
+                "ch0": t1_img_on_ref,
+                "ch1": t2_img_on_ref,
                 "mask_arr": fused_arr.astype(np.uint8),
-                "mask_ref": t1_img,
+                "mask_ref": ref_img,
             }
         ],
     }
@@ -277,17 +560,24 @@ def build_dataset(
     *,
     fusion_mode: str,
     strict: bool,
+    workers: int,
+    exclude_patients: set[str] | None = None,
 ) -> int:
     dst = dst_root / DATASET_NAME
     images_dir = dst / "imagesTr"
     labels_dir = dst / "labelsTr"
+    holdout_images = dst / "holdout" / "images"
+    holdout_labels = dst / "holdout" / "labels"
     images_dir.mkdir(parents=True, exist_ok=True)
     labels_dir.mkdir(parents=True, exist_ok=True)
 
+    exclude_patients = exclude_patients or set()
+
     # Ensure repeated runs are consistent: clear previous outputs if present.
-    for d in (images_dir, labels_dir):
-        for p in d.glob("*.nii.gz"):
-            p.unlink()
+    for d in (images_dir, labels_dir, holdout_images, holdout_labels):
+        if d.exists():
+            for p in d.glob("*.nii.gz"):
+                p.unlink()
     for p in (dst / "dataset.json", dst / "fusion_report.json"):
         if p.exists():
             p.unlink()
@@ -308,49 +598,95 @@ def build_dataset(
         print(f"[info] T1-only cases (dropped): {t1_only}")
     if t2_only:
         print(f"[info] T2-only cases (dropped): {t2_only}")
-    print(f"[info] building {DATASET_NAME} from {len(common)} common patients "
-          f"(fusion={fusion_mode})")
+    n_excluded = len([c for c in common if c in exclude_patients])
+    print(
+        f"[info] building {DATASET_NAME} from {len(common)} common patients "
+        f"(fusion={fusion_mode}, holdout_patients={n_excluded})"
+    )
 
     reports: list[dict] = []
     written = 0  # number of training cases written (derived cases, not patients)
-    for case_id in common:
-        case_dir_t1 = t1_root / case_id
-        case_dir_t2 = t2_root / case_id
-        try:
-            result = build_case(
-                case_dir_t1,
-                case_dir_t2,
+
+    workers = int(workers)
+    if workers < 1:
+        workers = 1
+    print(f"[info] alignment workers: {workers}")
+
+    unknown_ex = sorted(exclude_patients - set(common))
+    if unknown_ex:
+        print(
+            f"[warn] exclude list mentions patients not in T1∩T2 common set "
+            f"(ignored): {unknown_ex}"
+        )
+
+    # Parallelize across patients; each worker writes its own outputs atomically.
+    futures = {}
+    with ProcessPoolExecutor(max_workers=workers) as ex:
+        for case_id in common:
+            case_dir_t1 = t1_root / case_id
+            case_dir_t2 = t2_root / case_id
+            if case_id in exclude_patients:
+                holdout_images.mkdir(parents=True, exist_ok=True)
+                holdout_labels.mkdir(parents=True, exist_ok=True)
+                img_out = str(holdout_images)
+                lbl_out = str(holdout_labels)
+            else:
+                img_out = str(images_dir)
+                lbl_out = str(labels_dir)
+            fut = ex.submit(
+                _build_and_write_one_case,
+                case_id,
+                str(case_dir_t1),
+                str(case_dir_t2),
+                img_out,
+                lbl_out,
                 fusion_mode=fusion_mode,
                 strict=strict,
             )
-        except ValueError as exc:
-            raise ValueError(f"[{case_id}] {exc}") from exc
-        if result is None:
-            continue
-        report = result["report"]
-        samples = result["samples"]
+            futures[fut] = case_id
 
-        for s in samples:
-            out_id = s["case_id"]
-            sitk.WriteImage(s["ch0"], str(images_dir / f"{out_id}_0000.nii.gz"))
-            sitk.WriteImage(s["ch1"], str(images_dir / f"{out_id}_0001.nii.gz"))
-            _save_image_like_reference(
-                s["mask_arr"], s["mask_ref"], labels_dir / f"{out_id}.nii.gz", sitk.sitkUInt8
-            )
-            written += 1
+        for fut in as_completed(futures):
+            case_id = futures[fut]
+            try:
+                out = fut.result()
+            except Exception as exc:
+                # Record a synthetic report entry and keep going.
+                msg = f"{type(exc).__name__}: {exc}"
+                print(f"ERROR: [{case_id}] worker failed: {msg}")
+                reports.append(
+                    {
+                        "case_id": case_id,
+                        "mode": "error",
+                        "fusion_mode": fusion_mode,
+                        "derived_cases": [],
+                        "join_attempted": None,
+                        "join_qc_passed": False,
+                        "join_fail_reason": "worker_exception",
+                        "error": msg,
+                    }
+                )
+                continue
 
-        reports.append(report)
-        if report.get("mode") == "aligned":
-            print(
-                f"[{case_id}] mode=aligned T1fg={report['t1_fg']} T2fg->T1={report['t2_fg_on_t1']} "
-                f"retained={report['retained']} dice_raters={report['dice_raters']} "
-                f"fused_fg={report['fused_fg']} dir_mismatch={report['direction_mismatch']}"
-            )
-        else:
-            print(
-                f"[{case_id}] mode=split_mismatch derived={report['derived_cases']} "
-                f"T1fg={report['t1_fg']} T2fg_native={report['t2_fg_native']}"
-            )
+            report = out.get("report")
+            if report:
+                reports.append(report)
+                tag = " [HOLDOUT]" if case_id in exclude_patients else ""
+                if report.get("mode") == "aligned":
+                    print(
+                        f"[{case_id}] mode=aligned T1fg={report.get('t1_fg')} T2fg_on_ref={report.get('t2_fg_on_t1')} "
+                        f"t2_retained={report.get('retained')} dice_raters={report.get('dice_raters')} "
+                        f"fused_fg={report.get('fused_fg')} dir_mismatch={report.get('direction_mismatch')}{tag}"
+                    )
+                else:
+                    print(
+                        f"[{case_id}] mode=split_mismatch derived={report.get('derived_cases')} "
+                        f"T1fg={report.get('t1_fg')} T2fg_native={report.get('t2_fg_native')}{tag}"
+                    )
+            if case_id not in exclude_patients:
+                written += int(out.get("n_written") or 0)
+
+    # Make fusion_report.json deterministic across runs.
+    reports = sorted(reports, key=lambda r: r.get("case_id", ""))
 
     dataset_json = {
         "channel_names": {"0": "T1", "1": "T2"},
@@ -360,8 +696,9 @@ def build_dataset(
         "name": DATASET_NAME,
         "description": (
             "Atypical lipomatous tumor (ALT) MRI segmentation, 2-channel. "
-            f"Aligned cases use (T1 + T2 resampled onto T1 grid) with labels fused by {fusion_mode}. "
-            "Cases with direction-mismatch are split into two derived samples "
+            f"Aligned cases use (T1 + T2 resampled onto a common isotropic intersection-FOV grid) "
+            f"with labels fused by {fusion_mode}. "
+            "Cases that fail join QC are split into two derived samples "
             "(<case>_T1 and <case>_T2) with the missing channel filled with zeros "
             "and modality-native labels/grids."
         ),
@@ -373,14 +710,18 @@ def build_dataset(
         json.dump(
             {
                 "fusion_mode": fusion_mode,
+                "reference_grid": {
+                    "fov_policy": FOV_POLICY,
+                    "spacing_policy": "min_isotropic_per_case",
+                },
                 "min_foreground_retained": MIN_FOREGROUND_RETAINED,
                 "num_written": written,
                 "num_common_patients": len(common),
                 "notes": (
                     "num_written counts derived training cases. "
                     "Aligned patients emit one case_id. "
-                    "direction-mismatch patients emit two derived cases: <case>_T1 and <case>_T2 "
-                    "with a blank other channel and modality-native labels."
+                    "Patients that fail join QC emit two derived cases: <case>_T1 and <case>_T2 "
+                    "with a blank other channel and modality-native labels/grids."
                 ),
                 "cases": reports,
             },
@@ -413,12 +754,28 @@ def main() -> int:
         help="How to combine T1 and T2 expert masks. Default: union.",
     )
     parser.add_argument(
+        "--workers",
+        type=int,
+        default=_default_workers(),
+        help="Number of parallel worker processes for alignment (default: auto ~ half physical cores).",
+    )
+    parser.add_argument(
         "--strict",
         action="store_true",
         help=(
             "Abort on any case that loses too much label foreground when "
-            "resampling onto the T1 grid (default: skip such cases with a "
+            "resampling onto the common reference grid (default: skip such cases with a "
             "warning)."
+        ),
+    )
+    parser.add_argument(
+        "--exclude-cases-file",
+        type=Path,
+        default=None,
+        help=(
+            "Patient folder names (IOGxx) to write only under "
+            "Dataset503_ALT_T1T2/holdout/{images,labels}/; excluded from imagesTr/labelsTr. "
+            "Applies to the whole patient (all derived *_T1 / *_T2 rows for that patient)."
         ),
     )
     args = parser.parse_args()
@@ -433,7 +790,20 @@ def main() -> int:
         dst = Path(env_raw)
     dst.mkdir(parents=True, exist_ok=True)
 
-    build_dataset(args.src, dst, fusion_mode=args.fusion, strict=args.strict)
+    exclude_patients: set[str] = set()
+    if args.exclude_cases_file is not None:
+        if not args.exclude_cases_file.is_file():
+            raise SystemExit(f"--exclude-cases-file not found: {args.exclude_cases_file}")
+        exclude_patients = load_exclude_case_ids(args.exclude_cases_file)
+
+    build_dataset(
+        args.src,
+        dst,
+        fusion_mode=args.fusion,
+        strict=args.strict,
+        workers=args.workers,
+        exclude_patients=exclude_patients,
+    )
     return 0
 
 

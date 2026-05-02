@@ -94,16 +94,18 @@ def main() -> int:
     print()
 
     header = (
-        "| case | T1 fg | T2 fg (native) | T2 fg → T1 | retained | "
-        "Dice raters | fused fg | dir mismatch | same grid |"
+        "| case | T1 fg | T2 fg (native) | T2 fg → ref | t2_retained | "
+        "Dice raters | fused fg | dir mismatch | join ok | iso(mm) |"
     )
-    sep = "| --- | --- | --- | --- | --- | --- | --- | --- | --- |"
+    sep = "| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |"
     print(header)
     print(sep)
     for c in cases_sorted:
+        ref = c.get("ref") or {}
+        iso = ref.get("iso_spacing")
         print(
             "| {case} | {t1} | {t2n} | {t2t1} | {ret} | {dice} | {fused} | "
-            "{dirm} | {grid} |".format(
+            "{dirm} | {joinok} | {iso} |".format(
                 case=c.get("case_id", "?"),
                 t1=_fmt(c.get("t1_fg")),
                 t2n=_fmt(c.get("t2_fg_native")),
@@ -112,7 +114,8 @@ def main() -> int:
                 dice=_fmt(c.get("dice_raters")),
                 fused=_fmt(c.get("fused_fg")),
                 dirm="yes" if c.get("direction_mismatch") else "no",
-                grid="yes" if c.get("same_grid") else "no",
+                joinok="yes" if c.get("join_qc_passed") else "no",
+                iso=_fmt(iso),
             )
         )
     return 0

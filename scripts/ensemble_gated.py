@@ -48,6 +48,10 @@ Two gate modes:
 No retraining; just re-combines the argmax NIfTIs (and optionally the
 softmax .npz) that nnU-Net wrote during per-fold validation.
 
+Alternatively, pass ``--pred-dir-2d`` and ``--pred-dir-3d`` to combine flat
+``nnUNetv2_predict`` outputs (same case ids as ``*.nii.gz``), e.g. for a
+held-out test folder. Use ``--labels-dir`` pointing at holdout labels.
+
 Usage (with nnU-Net env vars set):
 
     # Hard gate (Semana 1 baseline)
@@ -219,34 +223,78 @@ def main() -> int:
     ap.add_argument("--labels-dir",
                     help="Path to labelsTr (defaults to "
                          "$nnUNet_raw/<dataset>/labelsTr).")
+    ap.add_argument(
+        "--pred-dir-2d",
+        default=None,
+        help="Flat directory of nnUNetv2_predict 2D outputs (*.nii.gz). "
+             "If set, --pred-dir-3d is required and fold validation dirs are not used.",
+    )
+    ap.add_argument(
+        "--pred-dir-3d",
+        default=None,
+        help="Flat directory of nnUNetv2_predict 3d_fullres outputs.",
+    )
+    ap.add_argument(
+        "--pred-dir-ensemble",
+        default=None,
+        help="Optional flat dir of soft-ensemble segmentations. If omitted, "
+             "soft-avg is synthesized from .npz next to 2D/3D predictions.",
+    )
     args = ap.parse_args()
 
     results = env_path("nnUNet_results")
     ds_dir = results / args.dataset
-    if not ds_dir.is_dir():
-        raise SystemExit(f"Missing dataset dir: {ds_dir}")
+
+    use_predict_dirs = args.pred_dir_2d is not None
+    if use_predict_dirs and args.pred_dir_3d is None:
+        raise SystemExit("--pred-dir-3d is required when --pred-dir-2d is set.")
+    if not use_predict_dirs and args.pred_dir_3d is not None:
+        raise SystemExit("--pred-dir-2d is required when --pred-dir-3d is set.")
 
     trainer_2d = args.trainer_2d or args.trainer
     trainer_3d = args.trainer_3d or args.trainer
-    d2_dir = ds_dir / f"{trainer_2d}__{args.plans_2d}__{args.config_2d}"
-    d3_dir = ds_dir / f"{trainer_3d}__{args.plans_3d}__{args.config_3d}"
-    fold_tag = "_".join(args.folds.split())
-    ens_dir = (ds_dir / "ensembles"
-               / f"ensemble___{trainer_2d}__{args.plans_2d}__{args.config_2d}"
-                 f"___{trainer_3d}__{args.plans_3d}__{args.config_3d}"
-                 f"___{fold_tag}")
-    for p, lab in [(d2_dir, "2D trainer"), (d3_dir, "3D trainer")]:
-        if not p.is_dir():
-            raise SystemExit(f"Missing {lab} dir: {p}")
-    ens_available = ens_dir.is_dir()
-    if not ens_available:
-        print(f"[warn] ensemble dir not found: {ens_dir}")
-        print("[warn] soft-avg will be synthesized on the fly from softmax "
-              "(requires --gate-mode sigmoid or .npz available).")
 
-    p2 = load_per_fold(d2_dir)
-    p3 = load_per_fold(d3_dir)
-    pe = load_flat(ens_dir) if ens_available else {}
+    if use_predict_dirs:
+        d2_dir = Path(args.pred_dir_2d).resolve()
+        d3_dir = Path(args.pred_dir_3d).resolve()
+        if not d2_dir.is_dir():
+            raise SystemExit(f"Missing --pred-dir-2d: {d2_dir}")
+        if not d3_dir.is_dir():
+            raise SystemExit(f"Missing --pred-dir-3d: {d3_dir}")
+        ens_dir: Path | None = None
+        if args.pred_dir_ensemble:
+            ens_dir = Path(args.pred_dir_ensemble).resolve()
+            if not ens_dir.is_dir():
+                raise SystemExit(f"Missing --pred-dir-ensemble: {ens_dir}")
+        ens_available = ens_dir is not None and ens_dir.is_dir()
+        if not ens_available:
+            print("[info] predict-dir mode: no --pred-dir-ensemble; "
+                  "soft-avg from 2D/3D .npz when available.")
+        p2 = load_flat(d2_dir)
+        p3 = load_flat(d3_dir)
+        pe = load_flat(ens_dir) if ens_available else {}
+    else:
+        if not ds_dir.is_dir():
+            raise SystemExit(f"Missing dataset dir: {ds_dir}")
+        d2_dir = ds_dir / f"{trainer_2d}__{args.plans_2d}__{args.config_2d}"
+        d3_dir = ds_dir / f"{trainer_3d}__{args.plans_3d}__{args.config_3d}"
+        fold_tag = "_".join(args.folds.split())
+        ens_dir = (ds_dir / "ensembles"
+                   / f"ensemble___{trainer_2d}__{args.plans_2d}__{args.config_2d}"
+                     f"___{trainer_3d}__{args.plans_3d}__{args.config_3d}"
+                     f"___{fold_tag}")
+        for p, lab in [(d2_dir, "2D trainer"), (d3_dir, "3D trainer")]:
+            if not p.is_dir():
+                raise SystemExit(f"Missing {lab} dir: {p}")
+        ens_available = ens_dir.is_dir()
+        if not ens_available:
+            print(f"[warn] ensemble dir not found: {ens_dir}")
+            print("[warn] soft-avg will be synthesized on the fly from softmax "
+                  "(requires --gate-mode sigmoid or .npz available).")
+
+        p2 = load_per_fold(d2_dir)
+        p3 = load_per_fold(d3_dir)
+        pe = load_flat(ens_dir) if ens_available else {}
 
     shared_23 = set(p2) & set(p3)
     if ens_available:
@@ -259,14 +307,20 @@ def main() -> int:
     labels_dir = (Path(args.labels_dir) if args.labels_dir
                   else env_path("nnUNet_raw") / args.dataset / "labelsTr")
 
+    if use_predict_dirs and not ds_dir.is_dir():
+        ds_dir.mkdir(parents=True, exist_ok=True)
     out_dir = ds_dir / f"gated_ensemble_{args.out_name}"
     out_dir.mkdir(parents=True, exist_ok=True)
     cases_dir = out_dir
     cases_dir.mkdir(parents=True, exist_ok=True)
 
+    if use_predict_dirs:
+        ens_display = str(ens_dir) if ens_dir else "(none; npz soft-avg)"
+    else:
+        ens_display = str(ens_dir) if ens_available else f"(missing: {ens_dir})"
     print(f"[info] 2D dir : {d2_dir}")
     print(f"[info] 3D dir : {d3_dir}")
-    print(f"[info] ens dir: {ens_dir}")
+    print(f"[info] ens dir: {ens_display}")
     print(f"[info] labels : {labels_dir}")
     print(f"[info] out    : {out_dir}")
     if args.gate_mode == "hard":
@@ -418,6 +472,10 @@ def main() -> int:
         "trainer_3d": trainer_3d,
         "plans_2d": args.plans_2d, "config_2d": args.config_2d,
         "plans_3d": args.plans_3d, "config_3d": args.config_3d,
+        "predict_flat_dirs": use_predict_dirs,
+        "pred_dir_2d": str(args.pred_dir_2d) if use_predict_dirs else None,
+        "pred_dir_3d": str(args.pred_dir_3d) if use_predict_dirs else None,
+        "pred_dir_ensemble": str(args.pred_dir_ensemble) if use_predict_dirs else None,
         "gate_mode": args.gate_mode,
         "min_fg_voxels": args.min_fg_voxels,
         "min_fg_ratio": args.min_fg_ratio,

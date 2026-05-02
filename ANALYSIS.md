@@ -2062,7 +2062,50 @@ Hasta que 503 pase a v2c en (2), **v2c gated sigue en producción**
   - `nnunet_env_T1T2/nnUNet_results/Dataset503_ALT_T1T2/nnUNetTrainerALT_os033_250epochs__nnUNetPlans__3d_fullres/`
     (5 folds, 43 casos).
 
-### 9.8 Resultados 5-fold medidos — T2-only y T1+T2 (2026-04-24)
+### 9.8 Exp. (2026-05-01) — Builder v2: join a grid común isotrópico + QC + paralelización
+
+**Motivación**: el builder original usaba *reference grid = T1* y, ante
+`direction_mismatch`, partía el paciente en dos casos derivados (`<case>_T1`,
+`<case>_T2`). Además, al remuestrear “T2 → T1” se pierde (a veces) resolución
+cuando T2 es más fino que T1.
+
+**Cambio de pipeline (Dataset503)**:
+
+- **Join por world-coords a un grid común por paciente** (sin registration):
+  - **Spacing**: isotrópico usando el **mínimo spacing** observado entre T1/T2
+    (alta resolución; mayor tamaño en voxels).
+  - **FOV**: **intersección** de los bounds físicos de T1 y T2 (sin padding fuera
+    del overlap).
+  - **Ejes**: dirección de T1 como referencia del grid.
+- **QC + fallback**:
+  - Check de **retención de foreground** tras remuestreo (umbral
+    `MIN_FOREGROUND_RETAINED`).
+  - Si el join falla QC, fallback a **split** (`<case>_T1`, `<case>_T2`) con canal
+    faltante en cero.
+  - Logging por caso en `fusion_report.json`: `join_attempted`,
+    `join_qc_passed`, `join_fail_reason`, y metadatos del grid (`ref.iso_spacing`,
+    `ref.ref_size`, etc.). Se mantienen campos legacy para compatibilidad.
+- **Paralelización del builder**:
+  - Nuevo flag `--workers` (default auto ≈ mitad de cores físicos).
+  - Escritura atómica por archivo (`tmp` con sufijo NIfTI + `os.replace`) para
+    evitar NIfTIs parciales.
+
+**Cómo correrlo**:
+
+```bash
+# Sólo build (paralelo por defecto):
+python scripts/build_t1t2_dataset.py --fusion union
+
+# Control explícito de workers:
+python scripts/build_t1t2_dataset.py --fusion union --workers 8
+
+# End-to-end (build+preprocess+train) vía wrapper:
+T1T2=1 FUSION=union bash run_training.sh
+```
+
+**Resultados**: TBD (se actualizan luego).
+
+### 9.9 Resultados 5-fold medidos — T2-only y T1+T2 (2026-04-24)
 
 #### 9.8.1 T2-only (`Dataset502_ALT_T2`, ALT_os033_250ep, 3d_fullres, TS-MRI pretrain)
 

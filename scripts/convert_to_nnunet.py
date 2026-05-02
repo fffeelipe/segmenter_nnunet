@@ -12,12 +12,20 @@ Output layout (under nnUNet_raw):
         imagesTr/IOGxx_0000.nii.gz
         labelsTr/IOGxx.nii.gz
         dataset.json
+        holdout/images/IOGyy_0000.nii.gz   # optional: patients listed in --exclude-cases-file
+        holdout/labels/IOGyy.nii.gz
     Dataset502_ALT_T2/
         imagesTr/IOGxx_0000.nii.gz
         labelsTr/IOGxx.nii.gz
         dataset.json
+        holdout/...
 
 Labels are re-saved as uint8 with values in {0, 1} (asserted).
+
+Holdout: ``--exclude-cases-file`` lists patient folder names (e.g. IOG12), one per
+line; ``#`` starts a comment. Those cases are written only under ``holdout/`` and
+are omitted from ``imagesTr``/``labelsTr`` so nnU-Net never pretrains or trains
+on them until you run inference separately.
 """
 from __future__ import annotations
 
@@ -35,6 +43,18 @@ DATASETS = {
     "T1": ("Dataset501_ALT_T1", "T1"),
     "T2": ("Dataset502_ALT_T2", "T2"),
 }
+
+
+def load_exclude_case_ids(path: Path) -> set[str]:
+    """Load patient ids to hold out (one per line; ``#`` comments; blank lines skipped)."""
+    text = path.read_text(encoding="utf-8")
+    out: set[str] = set()
+    for line in text.splitlines():
+        s = line.strip()
+        if not s or s.startswith("#"):
+            continue
+        out.add(s)
+    return out
 
 
 def find_pair(patient_dir: Path) -> tuple[Path, Path] | None:
@@ -191,20 +211,33 @@ def _fix_intensity(img: sitk.Image, case_id: str = "") -> sitk.Image:
     return out
 
 
-def convert_modality(src_root: Path, dst_root: Path, modality_dir: str) -> int:
+def convert_modality(
+    src_root: Path,
+    dst_root: Path,
+    modality_dir: str,
+    *,
+    exclude_cases: set[str] | None = None,
+) -> tuple[int, int]:
+    """Convert one modality. Returns ``(n_train, n_holdout)``."""
     ds_name, channel_name = DATASETS[modality_dir]
     dst = dst_root / ds_name
     images_dir = dst / "imagesTr"
     labels_dir = dst / "labelsTr"
+    holdout_img = dst / "holdout" / "images"
+    holdout_lbl = dst / "holdout" / "labels"
     images_dir.mkdir(parents=True, exist_ok=True)
     labels_dir.mkdir(parents=True, exist_ok=True)
+
+    exclude_cases = exclude_cases or set()
+    seen_ids: set[str] = set()
 
     src_modality = src_root / modality_dir
     if not src_modality.exists():
         raise FileNotFoundError(f"Missing source modality folder: {src_modality}")
 
     patients = sorted([p for p in src_modality.iterdir() if p.is_dir()])
-    count = 0
+    n_train = 0
+    n_holdout = 0
     skipped: list[str] = []
 
     for p in patients:
@@ -214,10 +247,10 @@ def convert_modality(src_root: Path, dst_root: Path, modality_dir: str) -> int:
             continue
         image_src, label_src = pair
         case_id = p.name
+        seen_ids.add(case_id)
 
         img = sitk.ReadImage(str(image_src))
         img = _fix_intensity(img, case_id=f"{modality_dir}/{case_id}")
-        sitk.WriteImage(img, str(images_dir / f"{case_id}_0000.nii.gz"))
 
         lbl = sitk.ReadImage(str(label_src))
         try:
@@ -226,15 +259,34 @@ def convert_modality(src_root: Path, dst_root: Path, modality_dir: str) -> int:
             )
         except ValueError as exc:
             raise ValueError(f"[{modality_dir}] {case_id}: {exc}") from exc
-        sitk.WriteImage(lbl_bin, str(labels_dir / f"{case_id}.nii.gz"))
 
-        count += 1
-        print(f"  [{modality_dir}] {case_id}: image={image_src.name} label={label_src.name}")
+        if case_id in exclude_cases:
+            holdout_img.mkdir(parents=True, exist_ok=True)
+            holdout_lbl.mkdir(parents=True, exist_ok=True)
+            sitk.WriteImage(img, str(holdout_img / f"{case_id}_0000.nii.gz"))
+            sitk.WriteImage(lbl_bin, str(holdout_lbl / f"{case_id}.nii.gz"))
+            n_holdout += 1
+            print(
+                f"  [{modality_dir}] {case_id}: HOLDOUT -> holdout/ "
+                f"image={image_src.name} label={label_src.name}"
+            )
+        else:
+            sitk.WriteImage(img, str(images_dir / f"{case_id}_0000.nii.gz"))
+            sitk.WriteImage(lbl_bin, str(labels_dir / f"{case_id}.nii.gz"))
+            n_train += 1
+            print(f"  [{modality_dir}] {case_id}: image={image_src.name} label={label_src.name}")
+
+    unknown = sorted(exclude_cases - seen_ids)
+    if unknown:
+        print(
+            f"[{modality_dir}] WARNING: exclude list mentions unknown case ids "
+            f"(not in T1/T2 folders or missing pairs): {unknown}"
+        )
 
     dataset_json = {
         "channel_names": {"0": channel_name},
         "labels": {"background": 0, "ALT": 1},
-        "numTraining": count,
+        "numTraining": n_train,
         "file_ending": ".nii.gz",
         "name": ds_name,
         "description": "Atypical lipomatous tumor (ALT) MRI segmentation.",
@@ -242,10 +294,10 @@ def convert_modality(src_root: Path, dst_root: Path, modality_dir: str) -> int:
     with open(dst / "dataset.json", "w") as fh:
         json.dump(dataset_json, fh, indent=2)
 
-    print(f"[{modality_dir}] wrote {count} cases to {dst}")
+    print(f"[{modality_dir}] wrote {n_train} train + {n_holdout} holdout under {dst}")
     if skipped:
         print(f"[{modality_dir}] skipped (no valid pair): {skipped}")
-    return count
+    return n_train, n_holdout
 
 
 def main() -> int:
@@ -279,6 +331,15 @@ def main() -> int:
         action="store_true",
         help="Shortcut for --modalities T2 (ignores --modalities if set).",
     )
+    parser.add_argument(
+        "--exclude-cases-file",
+        type=Path,
+        default=None,
+        help=(
+            "Text file of patient folder names (IOGxx) to write only under "
+            "dataset/holdout/{images,labels}/, excluded from imagesTr/labelsTr."
+        ),
+    )
     args = parser.parse_args()
     if args.t1_only and args.t2_only:
         raise SystemExit("--t1-only and --t2-only are mutually exclusive")
@@ -299,10 +360,21 @@ def main() -> int:
         modalities = ["T2"]
     else:
         modalities = list(args.modalities)
-    total = 0
+    exclude: set[str] = set()
+    if args.exclude_cases_file is not None:
+        if not args.exclude_cases_file.is_file():
+            raise SystemExit(f"--exclude-cases-file not found: {args.exclude_cases_file}")
+        exclude = load_exclude_case_ids(args.exclude_cases_file)
+    total_train = 0
+    total_holdout = 0
     for modality in modalities:
-        total += convert_modality(args.src, dst, modality)
-    print(f"Done. Converted {total} cases total across {'+'.join(modalities)}.")
+        tr, ho = convert_modality(args.src, dst, modality, exclude_cases=exclude)
+        total_train += tr
+        total_holdout += ho
+    print(
+        f"Done. Train cases={total_train}, holdout cases={total_holdout} "
+        f"across {'+'.join(modalities)}."
+    )
     return 0
 
 

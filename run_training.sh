@@ -87,25 +87,53 @@
 #                      3d_fullres which has batch_size=2 -> 1 per GPU).
 #   GPU_IDS           GPU indices for NUM_GPUS=2 (default "0 1")
 #   PER_PROC_THREADS  cap on OMP/OpenBLAS/MKL threads per process (inherited
-#                     by DA worker subprocesses). Default: 1 when NUM_GPUS=2
-#                     (avoids oversubscription: DA workers multiply this by
-#                     DA_PROCS). Set to 0 to disable capping on single-GPU
-#                     runs so libs autodetect.
+#                     by DA worker subprocesses). Default: 1 (scale CPU via
+#                     DA_PROCS, not BLAS threads inside each worker). Set to 0
+#                     to disable capping so libs autodetect.
 #   DA_PROCS          cap on batchgenerators worker processes per training
-#                     (maps to nnUNet_n_proc_DA). This is the main CPU
-#                     parallelism knob. Default on NUM_GPUS=2:
-#                     min(16, (phys_cores - 2*NUM_GPUS) / NUM_GPUS)
-#                     e.g. 14 on a 32-phys-core node, 10 on 24-phys-core,
-#                     6 on 16-phys-core. Uses physical cores (not SMT threads)
-#                     because batchgenerators workers are CPU-heavy numpy/scipy
-#                     and two workers per physical core oversubscribe.
+#                     (maps to nnUNet_n_proc_DA). Default: physical CPU core
+#                     count (lscpu; falls back to nproc). Override on NUM_GPUS=2
+#                     nodes if two parallel trainings oversubscribe the host.
+#   FORCE_T1T2_BUILD  1 -> always rerun scripts/build_t1t2_dataset.py when T1T2=1
+#                     (clears nnUNet_raw/Dataset503_ALT_T1T2 and re-aligns all cases).
+#                     Default 0: skip that step when dataset.json + imagesTr/*.nii.gz
+#                     already exist and .fusion_mode matches FUSION (fast resume).
+#   SKIP_COMPLETED_FOLDS  1 (default) -> if fold_* has checkpoint_final.pth, skip
+#                     nnUNetv2_train for that fold (training already finished).
+#                     Set to 0 to always invoke nnUNetv2_train (still uses --c when
+#                     checkpoints exist; delete fold_* to start truly fresh).
 #   PYTHON            python3
 #   TORCH_CUDA        cu118|cu121|cu124|cu126|cu128 (default cu128; Blackwell/RTX 50 requires cu128)
 #   CUDA_VISIBLE_DEVICES  honored when NUM_GPUS=1; ignored when NUM_GPUS=2
 #                         (we override it per fold to pin each fold to a GPU)
 #
-# Idempotent: nnU-Net auto-resumes from checkpoint_latest.pth when a fold
-# is re-run, so it's safe to restart this script after interruption.
+#   Holdout / test inference (optional):
+#   HOLDOUT_CASES_FILE   Path to a text file: one patient id per line (IOGxx),
+#                        ``#`` comments. Those cases are written only under
+#                        nnUNet_raw/Dataset.../holdout/{images,labels}/ and are
+#                        excluded from training. Changing this file invalidates
+#                        the matching nnUNet_preprocessed cache (same idea as
+#                        FUSION stamp for 503). Path may be repo-relative.
+#   RUN_HOLDOUT_EVAL     1 -> after find_best, run nnUNetv2_predict on holdout
+#                        images (2d + 3d_fullres, all FOLDS) and scripts/ensemble_gated.py
+#                        on flat prediction dirs (needs --save_probabilities).
+#                        Default 0. Requires holdout/images under each dataset.
+#   HOLDOUT_GATE_MODE    hard | sigmoid (default sigmoid, matches gated v2c).
+#   HOLDOUT_VMIN         --min-fg-voxels for sigmoid gate (default 1000).
+#   HOLDOUT_TAU          --tau for sigmoid (default 20).
+#   HOLDOUT_USE_CONF     1 -> add --use-confidence for sigmoid (default 1).
+#   HOLDOUT_MIN_RATIO    --min-fg-ratio when HOLDOUT_GATE_MODE=hard (default 0.1).
+#   HOLDOUT_GATED_OUT_NAME  suffix folder under nnUNet_results/<ds>/gated_ensemble_<name>
+#                        (default holdout_eval).
+#
+#   Example (T1, stratified train pool + locked test list):
+#     HOLDOUT_CASES_FILE=config/holdout_cases.example.txt RUN_HOLDOUT_EVAL=1 \\
+#       T1_ONLY=1 TRAINER=ALT_OS033 bash run_training.sh
+#
+# Training resume: nnUNetv2_train only loads checkpoints when given --c
+# (nnunetv2.run.run_training.maybe_load_checkpoint). This script passes --c when
+# a fold has checkpoint_latest or checkpoint_best but not yet checkpoint_final;
+# folds with checkpoint_final are skipped when SKIP_COMPLETED_FOLDS=1 (default).
 
 set -euo pipefail
 
@@ -197,6 +225,29 @@ TS_TASK_ID="${TS_TASK_ID:-852}"
 PYTHON="${PYTHON:-python3}"
 TORCH_CUDA="${TORCH_CUDA:-cu128}"
 
+HOLDOUT_CASES_FILE="${HOLDOUT_CASES_FILE:-}"
+HOLDOUT_RESOLVED=""
+HOLDOUT_EXCLUDE_ARGS=()
+if [[ -n "$HOLDOUT_CASES_FILE" ]]; then
+  if [[ "$HOLDOUT_CASES_FILE" != /* ]]; then
+    HOLDOUT_RESOLVED="$here/$HOLDOUT_CASES_FILE"
+  else
+    HOLDOUT_RESOLVED="$HOLDOUT_CASES_FILE"
+  fi
+  if [[ ! -f "$HOLDOUT_RESOLVED" ]]; then
+    echo "ERROR: HOLDOUT_CASES_FILE is not a file: $HOLDOUT_RESOLVED" >&2
+    exit 1
+  fi
+  HOLDOUT_EXCLUDE_ARGS=(--exclude-cases-file "$HOLDOUT_RESOLVED")
+fi
+RUN_HOLDOUT_EVAL="${RUN_HOLDOUT_EVAL:-0}"
+HOLDOUT_GATE_MODE="${HOLDOUT_GATE_MODE:-sigmoid}"
+HOLDOUT_VMIN="${HOLDOUT_VMIN:-1000}"
+HOLDOUT_TAU="${HOLDOUT_TAU:-20}"
+HOLDOUT_USE_CONF="${HOLDOUT_USE_CONF:-1}"
+HOLDOUT_MIN_RATIO="${HOLDOUT_MIN_RATIO:-0.1}"
+HOLDOUT_GATED_OUT_NAME="${HOLDOUT_GATED_OUT_NAME:-holdout_eval}"
+
 NUM_GPUS="${NUM_GPUS:-1}"
 if [[ "$NUM_GPUS" != "1" && "$NUM_GPUS" != "2" ]]; then
   echo "ERROR: NUM_GPUS must be 1 or 2 (got: $NUM_GPUS)" >&2
@@ -211,65 +262,16 @@ fi
 # Per-process thread / worker budgets.
 #
 # nnU-Net uses batchgenerators which spawns `nnUNet_n_proc_DA` *processes*
-# for data augmentation. Each augmentation worker is a fresh Python
-# process that inherits env vars, so if we set OPENBLAS_NUM_THREADS=8
-# that's actually 8 threads per worker (24 workers -> 192 BLAS threads
-# per training). With 2 parallel trainings this oversubscribes even a
-# 64-core node.
-#
-# Best practice:
-#   - Set BLAS/OMP threads = 1 for ALL processes to avoid oversubscription.
-#     Augmentation work is process-parallel, not thread-parallel, so this
-#     does NOT reduce throughput.
-#   - Set DA_PROCS high so augmentation scales with cores.
-#   - Reserve ~4 cores for the main trainer / torch intra-op / IO.
-#
-# Heuristic defaults scale with *physical* cores and `NUM_GPUS`; override via env.
-#
-# We deliberately ignore SMT/hyperthreads here: batchgenerators workers are
-# CPU-heavy numpy/scipy code, and two workers sharing one physical core via
-# SMT fight over the same FPU/L2 rather than doubling throughput. Using
-# `nproc` (= SMT threads) as the budget over-provisions on any SMT host and
-# causes context-switch thrash when NUM_GPUS=2 runs two trainings in
-# parallel.
+# for data augmentation. Each worker is a fresh Python process that inherits
+# env vars; high OPENBLAS_NUM_THREADS per worker multiplies across workers
+# and oversubscribes the host. Default: OMP/BLAS = 2 thread per process,
+# DA_PROCS = physical core count (not SMT). Override DA_PROCS when NUM_GPUS=2
+# if two parallel trainings need a lower per-job worker count.
 NCPU=$(nproc 2>/dev/null || echo 16)
 NCPU_PHYS=$(lscpu -p=Core,Socket 2>/dev/null | grep -v '^#' | sort -u | wc -l)
 (( NCPU_PHYS < 1 )) && NCPU_PHYS=$NCPU
-if [[ "$NUM_GPUS" == "2" ]]; then
-  # Workers per training ~ (phys_cores - reserved_main) / NUM_GPUS, capped at 16.
-  # Cap is lower than before (was 24 based on SMT threads) because diagnostics
-  # on 32-phys-core nodes showed workers sitting at ~50% CPU with DA_PROCS=24
-  # -> they were idling, and the extra processes added coordination overhead.
-  _RESERVED=$(( 2 * NUM_GPUS ))
-  _AVAIL=$(( NCPU_PHYS - _RESERVED ))
-  (( _AVAIL < NUM_GPUS * 4 )) && _AVAIL=$(( NUM_GPUS * 4 ))
-  _PER=$(( _AVAIL / NUM_GPUS ))
-  # Empirically on 2x RTX 5080 + 32-phys-core Threadripper, DA_PROCS=14/proc
-  # (28 workers total) oversubscribed and GPU util collapsed to <10%.
-  # Cap at 10/proc (20 total, leaves 12 phys cores for main trainer + torch
-  # intra-op + OS / FS IO). Lower cap also helps when torch.compile is off
-  # (data pipeline is less bursty, doesn't need as many feeder procs).
-  (( _PER > 10 )) && _PER=10
-  (( _PER < 4 )) && _PER=4
-  _DEF_T=1                # 1 thread per process; scale via DA_PROCS instead
-  _DEF_DA=$_PER
-else
-  # Single-GPU. Autodetect is unsafe inside containers: OpenBLAS sees the
-  # host's vCPU count (e.g. 64) and tries to spawn that many threads per
-  # DA worker process, which instantly exhausts RLIMIT_NPROC and crashes
-  # nnU-Net with "can't start new thread". Cap BLAS/OMP at 1 and pick a
-  # conservative DA worker count (~half of phys cores, minus the trainer,
-  # hard-capped at 8) so single-GPU runs work on vast.ai / Docker out of
-  # the box. Override with DA_PROCS / PER_PROC_THREADS if you know the
-  # host allows more.
-  _AVAIL1=$(( NCPU_PHYS - 2 ))
-  (( _AVAIL1 < 4 )) && _AVAIL1=4
-  _PER1=$(( _AVAIL1 / 2 ))
-  (( _PER1 > 8 )) && _PER1=8
-  (( _PER1 < 4 )) && _PER1=4
-  _DEF_T=1
-  _DEF_DA=$_PER1
-fi
+_DEF_T=2
+_DEF_DA=$NCPU_PHYS
 PER_PROC_THREADS="${PER_PROC_THREADS:-$_DEF_T}"   # OMP / OpenBLAS / MKL cap
 DA_PROCS="${DA_PROCS:-$_DEF_DA}"                  # batchgenerators workers
 
@@ -313,6 +315,10 @@ echo "   TS MRI task:    $TS_TASK_ID"
 echo "   NUM_GPUS:       $NUM_GPUS  (gpu ids: ${GPU_IDS_ARR[*]})"
 echo "   CPU threads:    nproc=$NCPU phys=$NCPU_PHYS -> per-proc=$PER_PROC_THREADS, DA workers=$DA_PROCS"
 echo "   torch.compile:  $_NNUNET_COMPILE_ENV  (NNUNET_COMPILE=$NNUNET_COMPILE)"
+if [[ -n "$HOLDOUT_RESOLVED" ]]; then
+  echo "   Holdout file:   $HOLDOUT_RESOLVED"
+  echo "   Run holdout eval: $RUN_HOLDOUT_EVAL"
+fi
 echo "=========================================================="
 
 # Try to bump the process/thread limit. In most containers this is capped
@@ -398,20 +404,42 @@ if [[ "$T1T2" == "1" ]]; then
   RAW_MARKER="$nnUNet_raw/Dataset503_ALT_T1T2/dataset.json"
   T1T2_RAW_DIR="$nnUNet_raw/Dataset503_ALT_T1T2"
   SRC_DIR="$here/T1"  # build_t1t2_dataset.py requires BOTH T1/ and T2/
-  if [[ -f "$RAW_MARKER" && ! -d "$SRC_DIR" ]]; then
-    echo "[data] nnUNet_raw already populated and T1/ source missing -> skipping build_t1t2_dataset.py"
+  FORCE_T1T2_BUILD="${FORCE_T1T2_BUILD:-0}"
+  T1T2_HAS_IMAGES=0
+  if [[ -d "$T1T2_RAW_DIR/imagesTr" ]]; then
+    shopt -s nullglob
+    _t1t2_glob=("$T1T2_RAW_DIR/imagesTr"/*.nii.gz)
+    shopt -u nullglob
+    ((${#_t1t2_glob[@]} > 0)) && T1T2_HAS_IMAGES=1
+  fi
+  _t1t2_fusion_ok() {
     if [[ ! -f "$T1T2_RAW_DIR/.fusion_mode" ]]; then
+      echo "[data] $T1T2_RAW_DIR/.fusion_mode missing -> writing FUSION=$FUSION (confirm this matches how labels were built)"
       echo "$FUSION" > "$T1T2_RAW_DIR/.fusion_mode"
-      echo "[data] wrote $T1T2_RAW_DIR/.fusion_mode=$FUSION (first run; verify raw labels match)"
-    elif [[ "$(cat "$T1T2_RAW_DIR/.fusion_mode")" != "$FUSION" ]]; then
+      return 0
+    fi
+    if [[ "$(cat "$T1T2_RAW_DIR/.fusion_mode")" != "$FUSION" ]]; then
       echo "ERROR: FUSION=$FUSION but $T1T2_RAW_DIR/.fusion_mode says $(cat "$T1T2_RAW_DIR/.fusion_mode")." >&2
       echo "       Raw labels were built with a different fusion mode. Restore T1/ and T2/ and re-run the builder," >&2
       echo "       or delete $T1T2_RAW_DIR and rsync a consistent raw tree." >&2
       exit 1
     fi
+    return 0
+  }
+  if [[ -f "$RAW_MARKER" && ! -d "$SRC_DIR" ]]; then
+    echo "[data] nnUNet_raw already populated and T1/ source missing -> skipping build_t1t2_dataset.py"
+    _t1t2_fusion_ok
+  elif [[ "$FORCE_T1T2_BUILD" != "1" && -f "$RAW_MARKER" && "$T1T2_HAS_IMAGES" == "1" ]]; then
+    _t1t2_fusion_ok
+    echo "[data] Dataset503_ALT_T1T2 already built (imagesTr + dataset.json present, fusion=$FUSION) -> skipping build_t1t2_dataset.py"
+    echo "[data] hint: set FORCE_T1T2_BUILD=1 after changing T1/ T2/ or FUSION to force a full rebuild."
   else
-    echo "[data] building 2-channel Dataset503_ALT_T1T2 (fusion=$FUSION)"
-    python scripts/build_t1t2_dataset.py --fusion "$FUSION"
+    if [[ "$FORCE_T1T2_BUILD" == "1" ]]; then
+      echo "[data] FORCE_T1T2_BUILD=1 -> rebuilding 2-channel Dataset503_ALT_T1T2 (fusion=$FUSION)"
+    else
+      echo "[data] building 2-channel Dataset503_ALT_T1T2 (fusion=$FUSION)"
+    fi
+    python scripts/build_t1t2_dataset.py --fusion "$FUSION" "${HOLDOUT_EXCLUDE_ARGS[@]}"
     echo "$FUSION" > "$T1T2_RAW_DIR/.fusion_mode"
   fi
 else
@@ -432,7 +460,7 @@ else
     echo "[data] nnUNet_raw already populated and $(basename "$SRC_DIR")/ source missing -> skipping convert_to_nnunet.py"
   else
     echo "[data] converting raw patient folders to nnU-Net raw datasets"
-    python scripts/convert_to_nnunet.py "${CONVERT_ARGS[@]}"
+    python scripts/convert_to_nnunet.py "${CONVERT_ARGS[@]}" "${HOLDOUT_EXCLUDE_ARGS[@]}"
   fi
 fi
 
@@ -490,6 +518,25 @@ if [[ "$T1T2" == "1" && -d "$PREP_DIR" ]]; then
     rm -rf "$PREP_DIR"
   fi
 fi
+# If the holdout list file changes (or stamp missing while holdout is enabled),
+# drop preprocessed cache for every dataset we train so splits/cases match raw.
+if [[ -n "$HOLDOUT_RESOLVED" ]]; then
+  _holdout_hash="$(sha256sum "$HOLDOUT_RESOLVED" | awk '{print $1}')"
+  for D in $DATASETS; do
+    case "$D" in
+      501) _hd_prep="$nnUNet_preprocessed/Dataset501_ALT_T1" ;;
+      502) _hd_prep="$nnUNet_preprocessed/Dataset502_ALT_T2" ;;
+      503) _hd_prep="$nnUNet_preprocessed/Dataset503_ALT_T1T2" ;;
+      *) continue ;;
+    esac
+    if [[ -d "$_hd_prep" ]]; then
+      if [[ ! -f "$_hd_prep/.holdout_stamp" ]] || [[ "$(cat "$_hd_prep/.holdout_stamp")" != "$_holdout_hash" ]]; then
+        echo "[plan] holdout list new/changed vs $_hd_prep/.holdout_stamp -> removing $_hd_prep"
+        rm -rf "$_hd_prep"
+      fi
+    fi
+  done
+fi
 PREP_HAS_DEFAULT=0
 if [[ -f "$PREP_DIR/nnUNetPlans.json" && -d "$PREP_DIR/nnUNetPlans_2d" ]]; then
   PREP_HAS_DEFAULT=1
@@ -506,6 +553,21 @@ else
   if [[ "$T1T2" == "1" && -d "$PREP_DIR" && -f "$nnUNet_raw/Dataset503_ALT_T1T2/.fusion_mode" ]]; then
     cp "$nnUNet_raw/Dataset503_ALT_T1T2/.fusion_mode" "$PREP_DIR/.fusion_mode"
     echo "[plan] stamped $PREP_DIR/.fusion_mode <- $(cat "$PREP_DIR/.fusion_mode")"
+  fi
+  if [[ -n "$HOLDOUT_RESOLVED" ]]; then
+    _holdout_hash="$(sha256sum "$HOLDOUT_RESOLVED" | awk '{print $1}')"
+    for D in $DATASETS; do
+      case "$D" in
+        501) _dstamp="$nnUNet_preprocessed/Dataset501_ALT_T1" ;;
+        502) _dstamp="$nnUNet_preprocessed/Dataset502_ALT_T2" ;;
+        503) _dstamp="$nnUNet_preprocessed/Dataset503_ALT_T1T2" ;;
+        *) continue ;;
+      esac
+      if [[ -d "$_dstamp" ]]; then
+        echo "$_holdout_hash" > "$_dstamp/.holdout_stamp"
+        echo "[plan] wrote $_dstamp/.holdout_stamp"
+      fi
+    done
   fi
 fi
 
@@ -547,9 +609,46 @@ fi
 # CUDA_VISIBLE_DEVICES, and wait on both before moving on. Per-fold stdout
 # is prefixed with [gpu<id>] so interleaved output stays readable; the
 # authoritative training logs still land in $nnUNet_results/.../fold_*/.
+SKIP_COMPLETED_FOLDS="${SKIP_COMPLETED_FOLDS:-1}"
+
+# Echo fold output dir (nnUNetTrainer.output_folder); return 1 if dataset path is ambiguous.
+nnunet_fold_base() {
+  local D="$1" PLANS="$2" C="$3" F="$4"
+  shopt -s nullglob
+  local matches=("$nnUNet_raw"/Dataset"${D}"_*)
+  shopt -u nullglob
+  if [[ ${#matches[@]} -ne 1 ]]; then
+    return 1
+  fi
+  echo "$nnUNet_results/$(basename "${matches[0]}")/${TRAINER}__${PLANS}__${C}/fold_${F}"
+}
+
 train_one() {
   local D="$1" C="$2" F="$3" PLANS="$4" GPU_ID="$5"
   shift 5
+  local -a pretrain_args=("$@")
+  local -a ckpt_args=()
+  local fold_base=""
+  if fold_base=$(nnunet_fold_base "$D" "$PLANS" "$C" "$F"); then
+    :
+  else
+    fold_base=""
+  fi
+
+  if [[ -n "$fold_base" && -f "$fold_base/checkpoint_final.pth" ]]; then
+    if [[ "$SKIP_COMPLETED_FOLDS" == "1" ]]; then
+      echo "[train] fold_${F} already complete (checkpoint_final.pth) -> skipping nnUNetv2_train"
+      echo "---- train: dataset=$D config=$C fold=$F plans=$PLANS trainer=$TRAINER gpu=$GPU_ID ----"
+      return 0
+    fi
+    echo "[train] fold_${F} has checkpoint_final.pth but SKIP_COMPLETED_FOLDS=0 -> nnUNetv2_train --c"
+    ckpt_args=(--c)
+  elif [[ -n "$fold_base" && ( -f "$fold_base/checkpoint_latest.pth" || -f "$fold_base/checkpoint_best.pth" ) ]]; then
+    echo "[train] fold_${F} has partial checkpoint -> nnUNetv2_train --c (cannot combine with -pretrained_weights)"
+    ckpt_args=(--c)
+  else
+    ckpt_args=("${pretrain_args[@]}")
+  fi
   echo "---- train: dataset=$D config=$C fold=$F plans=$PLANS trainer=$TRAINER gpu=$GPU_ID ----"
   # Cap BLAS / OpenMP threads and batchgenerators workers per process. If
   # PER_PROC_THREADS is 0 (single-GPU run), skip the caps and let the libs
@@ -572,7 +671,7 @@ train_one() {
     nnUNetv2_train "$D" "$C" "$F" \
       -tr "$TRAINER" \
       -p "$PLANS" \
-      "$@" \
+      "${ckpt_args[@]}" \
       --npz 2>&1 | sed -u "s/^/[gpu${GPU_ID} d=${D} c=${C} f=${F}] /"
   return "${PIPESTATUS[0]}"
 }
@@ -647,6 +746,102 @@ for D in $DATASETS; do
     -c $CONFIGS \
     -f $FOLDS || true
 done
+
+# 9. Optional holdout: nnUNetv2_predict (2d + 3d_fullres) + gated ensemble on flat dirs.
+nnunet_one_raw_dataset_dir() {
+  local D="$1"
+  shopt -s nullglob
+  local m=("$nnUNet_raw"/Dataset"${D}"_*)
+  shopt -u nullglob
+  if ((${#m[@]} != 1)); then
+    return 1
+  fi
+  printf '%s' "${m[0]}"
+}
+
+if [[ "$RUN_HOLDOUT_EVAL" == "1" ]]; then
+  echo ""
+  echo "---- holdout inference + gated eval (RUN_HOLDOUT_EVAL=1) ----"
+  _PRED_FOLD_ARGS=(-f)
+  for _pf in $FOLDS; do
+    _PRED_FOLD_ARGS+=("$_pf")
+  done
+  for D in $DATASETS; do
+    raw_ds="$(nnunet_one_raw_dataset_dir "$D")" || {
+      echo "[holdout] WARN: skip $D: could not resolve nnUNet_raw/Dataset${D}_*"
+      continue
+    }
+    hi="$raw_ds/holdout/images"
+    hl="$raw_ds/holdout/labels"
+    if [[ ! -d "$hi" ]]; then
+      echo "[holdout] skip dataset $D: missing $hi"
+      continue
+    fi
+    shopt -s nullglob
+    _hn=("$hi"/*.nii.gz)
+    shopt -u nullglob
+    if ((${#_hn[@]} == 0)); then
+      echo "[holdout] skip dataset $D: no *.nii.gz in $hi (set HOLDOUT_CASES_FILE and rebuild raw)."
+      continue
+    fi
+    ds_name="$(basename "$raw_ds")"
+    D_MULTICHANNEL=0
+    if [[ "$D" =~ $MULTICHANNEL_DATASETS_RE ]]; then
+      D_MULTICHANNEL=1
+    fi
+    if [[ "$D_MULTICHANNEL" == "1" ]]; then
+      PLANS_3D_PRED="nnUNetPlans"
+    else
+      PLANS_3D_PRED="nnUNetTSMRIPlans"
+    fi
+    out_2d="$nnUNet_results/$ds_name/holdout_pred_2d"
+    out_3d="$nnUNet_results/$ds_name/holdout_pred_3d"
+    rm -rf "$out_2d" "$out_3d"
+    mkdir -p "$out_2d" "$out_3d"
+    gpu_pred="${GPU_IDS_ARR[0]}"
+    _pred_env=( "CUDA_VISIBLE_DEVICES=$gpu_pred" )
+    if (( PER_PROC_THREADS > 0 )); then
+      _pred_env+=(
+        "OMP_NUM_THREADS=$PER_PROC_THREADS"
+        "OPENBLAS_NUM_THREADS=$PER_PROC_THREADS"
+        "MKL_NUM_THREADS=$PER_PROC_THREADS"
+        "NUMEXPR_NUM_THREADS=$PER_PROC_THREADS"
+        "VECLIB_MAXIMUM_THREADS=$PER_PROC_THREADS"
+      )
+    fi
+    _pred_env+=( "nnUNet_compile=$_NNUNET_COMPILE_ENV" )
+    echo "[holdout] dataset=$D ($ds_name) predict 2d -> $out_2d"
+    env "${_pred_env[@]}" nnUNetv2_predict \
+      -d "$D" -i "$hi" -o "$out_2d" \
+      -tr "$TRAINER" -c 2d -p nnUNetPlans \
+      "${_PRED_FOLD_ARGS[@]}" --save_probabilities
+    echo "[holdout] dataset=$D ($ds_name) predict 3d_fullres ($PLANS_3D_PRED) -> $out_3d"
+    env "${_pred_env[@]}" nnUNetv2_predict \
+      -d "$D" -i "$hi" -o "$out_3d" \
+      -tr "$TRAINER" -c 3d_fullres -p "$PLANS_3D_PRED" \
+      "${_PRED_FOLD_ARGS[@]}" --save_probabilities
+    echo "[holdout] gated ensemble -> $nnUNet_results/$ds_name/gated_ensemble_${HOLDOUT_GATED_OUT_NAME}/"
+    _gate_cmd=(
+      python scripts/ensemble_gated.py
+      --dataset "$ds_name"
+      --trainer "$TRAINER"
+      --pred-dir-2d "$out_2d"
+      --pred-dir-3d "$out_3d"
+      --labels-dir "$hl"
+      --out-name "$HOLDOUT_GATED_OUT_NAME"
+      --gate-mode "$HOLDOUT_GATE_MODE"
+      --min-fg-voxels "$HOLDOUT_VMIN"
+      --min-fg-ratio "$HOLDOUT_MIN_RATIO"
+    )
+    if [[ "$HOLDOUT_GATE_MODE" == "sigmoid" ]]; then
+      _gate_cmd+=(--tau "$HOLDOUT_TAU")
+      if [[ "$HOLDOUT_USE_CONF" == "1" ]]; then
+        _gate_cmd+=(--use-confidence)
+      fi
+    fi
+    "${_gate_cmd[@]}"
+  done
+fi
 
 echo ""
 echo "=========================================================="
