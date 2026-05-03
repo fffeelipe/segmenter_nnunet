@@ -1,0 +1,191 @@
+{
+  "dataset": "Dataset503_ALT_T1T2",
+  "counts": {
+    "n_patients_patient_level_eval": 46,
+    "n_samples_numTraining": 58,
+    "n_direction_mismatch_patients_split": 12,
+    "direction_mismatch_patients": [
+      "IOG10",
+      "IOG2",
+      "IOG27",
+      "IOG28",
+      "IOG35",
+      "IOG38",
+      "IOG45",
+      "IOG46",
+      "IOG47",
+      "IOG51",
+      "IOG55",
+      "IOG7"
+    ],
+    "n_aligned_patients_single_sample": 34
+  },
+  "spacing_mm": {
+    "z": {
+      "n": 46,
+      "mean": 5.03228261159814,
+      "std": 1.044807627804527,
+      "min": 3.299999952316284,
+      "p05": 3.5999999046325684,
+      "p25": 4.375,
+      "median": 5.0,
+      "p75": 5.600000262260437,
+      "p95": 6.899999976158142,
+      "max": 7.199999809265137
+    },
+    "y": {
+      "n": 46,
+      "mean": 0.7422323353264643,
+      "std": 0.25827397597877083,
+      "min": 0.22727273404598236,
+      "p05": 0.3125,
+      "p25": 0.5507999807596207,
+      "median": 0.7812750041484833,
+      "p75": 0.9151785969734192,
+      "p95": 1.0677083730697632,
+      "max": 1.25
+    },
+    "x": {
+      "n": 46,
+      "mean": 0.7422323353264643,
+      "std": 0.25827397597877083,
+      "min": 0.22727273404598236,
+      "p05": 0.3125,
+      "p25": 0.5507999807596207,
+      "median": 0.7812750041484833,
+      "p75": 0.9151785969734192,
+      "p95": 1.0677083730697632,
+      "max": 1.25
+    },
+    "in_plane_mean_xy": {
+      "n": 46,
+      "mean": 0.7422323353264643,
+      "std": 0.25827397597877083,
+      "min": 0.22727273404598236,
+      "p05": 0.3125,
+      "p25": 0.5507999807596207,
+      "median": 0.7812750041484833,
+      "p75": 0.9151785969734192,
+      "p95": 1.0677083730697632,
+      "max": 1.25
+    }
+  },
+  "shape_after_crop_voxels": {
+    "z_slices": {
+      "n": 46,
+      "mean": 39.26086956521739,
+      "std": 14.744392203454009,
+      "min": 12.0,
+      "p05": 13.75,
+      "p25": 30.0,
+      "median": 40.0,
+      "p75": 50.0,
+      "p95": 60.0,
+      "max": 69.0
+    },
+    "y": {
+      "n": 46,
+      "mean": 368.0869565217391,
+      "std": 121.14909566993272,
+      "min": 239.0,
+      "p05": 252.0,
+      "p25": 289.5,
+      "median": 320.0,
+      "p75": 467.0,
+      "p95": 569.75,
+      "max": 704.0
+    },
+    "x": {
+      "n": 46,
+      "mean": 422.2608695652174,
+      "std": 81.62282763013154,
+      "min": 255.0,
+      "p05": 319.0,
+      "p25": 362.25,
+      "median": 447.0,
+      "p75": 471.5,
+      "p95": 516.5,
+      "max": 619.0
+    }
+  },
+  "plans_medians": {
+    "original_median_spacing_after_transp": [
+      5.0,
+      0.7812750041484833,
+      0.7812750041484833
+    ],
+    "original_median_shape_after_transp": [
+      40,
+      320,
+      447
+    ],
+    "target_spacing_3d_fullres": [
+      3.5999999046325684,
+      0.7812750041484833,
+      0.7812750041484833
+    ],
+    "target_spacing_2d": [
+      0.7812750041484833,
+      0.7812750041484833
+    ],
+    "patch_size_3d_fullres": [
+      32,
+      192,
+      288
+    ],
+    "patch_size_2d": [
+      384,
+      512
+    ],
+    "batch_size_3d_fullres": 2,
+    "batch_size_2d": 16
+  },
+  "tumor_size_proxy": {
+    "n_ref_voxels_sample_level": {
+      "n": 58,
+      "mean": 59319.15517241379,
+      "std": 61220.60856079794,
+      "min": 405.0,
+      "p05": 3105.5499999999997,
+      "p25": 11636.25,
+      "median": 42163.0,
+      "p75": 86815.5,
+      "p95": 163111.6499999999,
+      "max": 273872.0
+    },
+    "n_ref_voxels_patient_level_avg_T1T2": {
+      "n": 46,
+      "mean": 63781.586956521736,
+      "std": 64877.68009332848,
+      "min": 424.0,
+      "p05": 4508.75,
+      "p25": 13808.0,
+      "median": 42833.5,
+      "p75": 101253.0,
+      "p95": 200402.25,
+      "max": 273872.0
+    },
+    "approx_voxel_volume_mm3_from_original_median_spacing": 3.051953160536063,
+    "approx_tumor_volume_mm3_patient_level": {
+      "n": 46,
+      "mean": 194658.41589596224,
+      "std": 198003.64080908147,
+      "min": 1294.0281400672907,
+      "p05": 13760.493812566972,
+      "p25": 42141.369240681954,
+      "median": 130725.83570182144,
+      "p75": 309019.41336375795,
+      "p95": 611618.2802660381,
+      "max": 835844.5159823326
+    },
+    "notes": "n_ref extracted from nnUNet postprocessed CV summaries (union_v2 3D). Patient-level values average derived <case>_T1/<case>_T2 if present. mm^3 volumes are approximated using the median voxel volume from nnUNet plans."
+  },
+  "sources": {
+    "fingerprint": "nnunet_env/nnUNet_preprocessed/Dataset503_ALT_T1T2/dataset_fingerprint.json",
+    "plans": "nnunet_env/nnUNet_preprocessed/Dataset503_ALT_T1T2/nnUNetPlans.json",
+    "splits": "nnunet_env/nnUNet_preprocessed/Dataset503_ALT_T1T2/splits_final.json",
+    "patient_csv": "reports/per_case_baseline_and_mixed.csv",
+    "summary_fold0": "nnUNet_results_union_V2/Dataset503_ALT_T1T2/nnUNetTrainerALT_os033_250epochs__nnUNetPlans__3d_fullres/crossval_results_folds_0/postprocessed/summary.json",
+    "summary_folds1_4": "nnUNet_results_union_V2/Dataset503_ALT_T1T2/nnUNetTrainerALT_os033_250epochs__nnUNetPlans__3d_fullres/crossval_results_folds_1_2_3_4/postprocessed/summary.json"
+  }
+}

@@ -1,0 +1,12 @@
+case 26 is probaby undersegmented
+should we assume that the use of the model will always contain T1 and T2 scans?
+what to do the hard 0 dice cases?
+                                                                                                        
+case 45 in T2 is basically unique in terms of direction: keep
+
+
+* test set
+* force same orientation [examples] (done, but missing testing)
+* print/present examples from 2d, 3d, ensemble
+* [training validation] [dice and loss] (graph)
+
