@@ -30,7 +30,6 @@ from __future__ import annotations
 import argparse
 import json
 import os
-import subprocess
 import sys
 from pathlib import Path
 
@@ -42,8 +41,11 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from convert_to_nnunet import (  # noqa: E402
     GEOM_TOL,
     MIN_FOREGROUND_RETAINED,
+    _clip_percentiles,
+    _default_workers,
     _fix_intensity,
     _geom_matches,
+    _guess_physical_cores,
     _prebinarize,
     align_label_to_image,
     find_pair,
@@ -52,30 +54,9 @@ from convert_to_nnunet import (  # noqa: E402
 
 
 DATASET_NAME = "Dataset503_ALT_T1T2"
+DATASET_NAME_CLIP = "Dataset504_ALT_T1T2_clip"
 FUSION_MODES = ("union", "intersection", "staple")
 FOV_POLICY = "intersection"
-
-
-def _guess_physical_cores() -> int:
-    """Best-effort estimate of physical core count (Linux), else fallback."""
-    try:
-        out = subprocess.check_output(["lscpu", "-p=Core,Socket"], text=True)
-        cores = set()
-        for line in out.splitlines():
-            if not line or line.startswith("#"):
-                continue
-            core, sock = line.split(",")[:2]
-            cores.add((core.strip(), sock.strip()))
-        if cores:
-            return int(len(cores))
-    except Exception:
-        pass
-    return int(os.cpu_count() or 1)
-
-
-def _default_workers() -> int:
-    phys = max(1, _guess_physical_cores())
-    return max(1, phys // 2)
 
 
 def _tmp_path(final_path: Path) -> Path:
@@ -284,6 +265,8 @@ def _build_and_write_one_case(
     *,
     fusion_mode: str,
     strict: bool,
+    clip_p_lo: float | None = None,
+    clip_p_hi: float | None = None,
 ) -> dict:
     """Worker entrypoint: build one patient and write outputs for its samples."""
     result = build_case(
@@ -291,6 +274,8 @@ def _build_and_write_one_case(
         Path(case_dir_t2),
         fusion_mode=fusion_mode,
         strict=strict,
+        clip_p_lo=clip_p_lo,
+        clip_p_hi=clip_p_hi,
     )
     if result is None:
         return {"case_id": case_id, "mode": "skipped", "report": None, "n_written": 0}
@@ -320,6 +305,8 @@ def build_case(
     *,
     fusion_mode: str,
     strict: bool,
+    clip_p_lo: float | None = None,
+    clip_p_hi: float | None = None,
 ) -> dict | None:
     """Process one patient; return a dict bundle or None if skipped.
 
@@ -345,6 +332,17 @@ def build_case(
 
     t2_img_native = sitk.ReadImage(str(t2_img_path))
     t2_img_native = _fix_intensity(t2_img_native, case_id=f"T2/{case_id}")
+
+    if clip_p_lo is not None and clip_p_hi is not None:
+        t1_img = _clip_percentiles(
+            t1_img, p_lo=clip_p_lo, p_hi=clip_p_hi, case_id=f"T1/{case_id}"
+        )
+        t2_img_native = _clip_percentiles(
+            t2_img_native,
+            p_lo=clip_p_lo,
+            p_hi=clip_p_hi,
+            case_id=f"T2/{case_id}",
+        )
 
     t1_lbl_raw = sitk.ReadImage(str(t1_lbl_path))
     t2_lbl_raw = sitk.ReadImage(str(t2_lbl_path))
@@ -562,8 +560,12 @@ def build_dataset(
     strict: bool,
     workers: int,
     exclude_patients: set[str] | None = None,
+    clip_p_lo: float | None = None,
+    clip_p_hi: float | None = None,
 ) -> int:
-    dst = dst_root / DATASET_NAME
+    use_clip = clip_p_lo is not None and clip_p_hi is not None
+    ds_name = DATASET_NAME_CLIP if use_clip else DATASET_NAME
+    dst = dst_root / ds_name
     images_dir = dst / "imagesTr"
     labels_dir = dst / "labelsTr"
     holdout_images = dst / "holdout" / "images"
@@ -586,7 +588,7 @@ def build_dataset(
     t2_root = src_root / "T2"
     if not t1_root.exists() or not t2_root.exists():
         raise FileNotFoundError(
-            f"Both {t1_root} and {t2_root} must exist to build {DATASET_NAME}"
+            f"Both {t1_root} and {t2_root} must exist to build {ds_name}"
         )
 
     t1_cases = {p.name for p in t1_root.iterdir() if p.is_dir()}
@@ -600,8 +602,9 @@ def build_dataset(
         print(f"[info] T2-only cases (dropped): {t2_only}")
     n_excluded = len([c for c in common if c in exclude_patients])
     print(
-        f"[info] building {DATASET_NAME} from {len(common)} common patients "
-        f"(fusion={fusion_mode}, holdout_patients={n_excluded})"
+        f"[info] building {ds_name} from {len(common)} common patients "
+        f"(fusion={fusion_mode}, holdout_patients={n_excluded}"
+        f"{', clip=on' if use_clip else ''})"
     )
 
     reports: list[dict] = []
@@ -642,6 +645,8 @@ def build_dataset(
                 lbl_out,
                 fusion_mode=fusion_mode,
                 strict=strict,
+                clip_p_lo=clip_p_lo,
+                clip_p_hi=clip_p_hi,
             )
             futures[fut] = case_id
 
@@ -693,12 +698,16 @@ def build_dataset(
         "labels": {"background": 0, "ALT": 1},
         "numTraining": written,
         "file_ending": ".nii.gz",
-        "name": DATASET_NAME,
+        "name": ds_name,
         "description": (
             "Atypical lipomatous tumor (ALT) MRI segmentation, 2-channel. "
             f"Aligned cases use (T1 + T2 resampled onto a common isotropic intersection-FOV grid) "
             f"with labels fused by {fusion_mode}. "
-            "Cases that fail join QC are split into two derived samples "
+            + (
+                f"Intensities clipped at p{clip_p_lo}/p{clip_p_hi} per channel after _fix_intensity. "
+                if use_clip else ""
+            )
+            + "Cases that fail join QC are split into two derived samples "
             "(<case>_T1 and <case>_T2) with the missing channel filled with zeros "
             "and modality-native labels/grids."
         ),
@@ -778,6 +787,27 @@ def main() -> int:
             "Applies to the whole patient (all derived *_T1 / *_T2 rows for that patient)."
         ),
     )
+    parser.add_argument(
+        "--percentile-clip",
+        action="store_true",
+        help=(
+            "Clip both channel intensities at --clip-p-lo / --clip-p-hi after "
+            "_fix_intensity. Writes to Dataset504_ALT_T1T2_clip so the "
+            "un-clipped baseline cache (Dataset503_ALT_T1T2) stays intact."
+        ),
+    )
+    parser.add_argument(
+        "--clip-p-lo",
+        type=float,
+        default=0.5,
+        help="Lower percentile for --percentile-clip (default 0.5).",
+    )
+    parser.add_argument(
+        "--clip-p-hi",
+        type=float,
+        default=99.5,
+        help="Upper percentile for --percentile-clip (default 99.5).",
+    )
     args = parser.parse_args()
 
     dst = args.dst
@@ -796,6 +826,11 @@ def main() -> int:
             raise SystemExit(f"--exclude-cases-file not found: {args.exclude_cases_file}")
         exclude_patients = load_exclude_case_ids(args.exclude_cases_file)
 
+    clip_kwargs = (
+        {"clip_p_lo": args.clip_p_lo, "clip_p_hi": args.clip_p_hi}
+        if args.percentile_clip
+        else {}
+    )
     build_dataset(
         args.src,
         dst,
@@ -803,6 +838,7 @@ def main() -> int:
         strict=args.strict,
         workers=args.workers,
         exclude_patients=exclude_patients,
+        **clip_kwargs,
     )
     return 0
 

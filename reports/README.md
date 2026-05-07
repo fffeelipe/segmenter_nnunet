@@ -18,7 +18,7 @@ combining:
 From the repo root:
 
 ```bash
-python reports/build_per_case_baseline_and_mixed.py
+python scripts/update_per_case_baseline_and_mixed.py
 ```
 
 It overwrites:
@@ -54,7 +54,7 @@ The script is path-opinionated; it matches the layout described in `ANALYSIS.md`
 ### Sanity checks / common pitfalls
 
 - If you moved results folders or renamed trainers, update the paths in
-  `reports/build_per_case_baseline_and_mixed.py` (function `_default_inputs`).
+  `scripts/update_per_case_baseline_and_mixed.py` (function `_default_inputs`).
 - Dataset503 summaries may include `*_T1/_T2` entries (two masks per patient). The
   CSV is per-patient, so those are averaged.
 

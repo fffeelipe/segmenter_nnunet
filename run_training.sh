@@ -70,6 +70,15 @@
 #                          Mutually exclusive with T1_ONLY / T2_ONLY.
 #   FUSION            union | intersection | staple  (default union;
 #                          only used when T1T2=1 / DATASETS includes 503).
+#   CLIP              0 | 1                       (default 0)
+#                      1 -> apply percentile intensity clipping (p_lo, p_hi)
+#                      after _fix_intensity. Writes to the clipped sibling
+#                      datasets so the un-clipped baseline cache stays intact:
+#                        T1_ONLY=1 + CLIP=1 -> Dataset505_ALT_T1_clip
+#                        T2_ONLY=1 + CLIP=1 -> Dataset506_ALT_T2_clip
+#                        T1T2=1   + CLIP=1 -> Dataset504_ALT_T1T2_clip
+#   CLIP_P_LO         lower percentile for CLIP=1 (default 0.5)
+#   CLIP_P_HI         upper percentile for CLIP=1 (default 99.5)
 #   FOLDS             "0 1 2 3 4"               (default all 5 for 5-fold CV)
 #   CONFIGS           "3d_fullres 2d"           (default both; find_best picks winner)
 #   DATASETS          "501 502"                 (default both unless T1_ONLY=1 /
@@ -80,11 +89,16 @@
 #                     Default: 1 when TRAINER=ALT, else 0.
 #   TS_TASK_ID        852 (TotalSegmentator MRI task for pretraining)
 #   NUM_GPUS          1 | 2                     (default 1)
-#                      2 -> train two folds in parallel, one per GPU (fold-level
-#                      parallelism via CUDA_VISIBLE_DEVICES). Recommended for
-#                      2-GPU nodes because each fold keeps its full batch_size
-#                      (DDP with num_gpus=2 would halve batch_size and hurt
-#                      3d_fullres which has batch_size=2 -> 1 per GPU).
+#                      2 -> 2-slot work-stealing scheduler over the flat
+#                      {DATASETS} x {CONFIGS} x {FOLDS} cartesian product.
+#                      Each unit runs as its own process pinned to one GPU
+#                      via CUDA_VISIBLE_DEVICES; each unit keeps its full
+#                      batch_size (DDP with num_gpus=2 would halve batch_size
+#                      and hurt 3d_fullres which has batch_size=2 -> 1 per
+#                      GPU). Pairs across configs / datasets so a final solo
+#                      fold within one config never leaves a GPU idle (a
+#                      common 5-fold-per-config waste on the previous
+#                      pairs-only scheduler). Requires bash 4.3+ (wait -n).
 #   GPU_IDS           GPU indices for NUM_GPUS=2 (default "0 1")
 #   PER_PROC_THREADS  cap on OMP/OpenBLAS/MKL threads per process (inherited
 #                     by DA worker subprocesses). Default: 1 (scale CPU via
@@ -127,8 +141,21 @@
 #                        (default holdout_eval).
 #
 #   Example (T1, stratified train pool + locked test list):
-#     HOLDOUT_CASES_FILE=config/holdout_cases.example.txt RUN_HOLDOUT_EVAL=1 \\
+#     HOLDOUT_CASES_FILE=holdout_cases.txt RUN_HOLDOUT_EVAL=1 \\
 #       T1_ONLY=1 TRAINER=ALT_OS033 bash run_training.sh
+#
+#   Note: when ``holdout_cases.txt`` exists at the repo root, both
+#   HOLDOUT_CASES_FILE and RUN_HOLDOUT_EVAL default to that file / to 1.
+#   Pass ``HOLDOUT_CASES_FILE=`` (explicit empty) to opt out.
+#
+#   CV-time gated ensemble (v2c sigmoid + confidence):
+#   RUN_CV_GATED         1 (default) -> after find_best, run scripts/ensemble_gated.py
+#                        on per-fold validation outputs (single-channel datasets only;
+#                        multichannel 503 keeps the existing holdout-only gating).
+#                        Output dir suffix: gated_ensemble_<CV_GATED_OUT_NAME>/
+#                        Set to 0 to skip.
+#   CV_GATED_OUT_NAME    suffix folder under nnUNet_results/<ds>/gated_ensemble_<name>
+#                        (default v2c_cv).
 #
 # Training resume: nnUNetv2_train only loads checkpoints when given --c
 # (nnunetv2.run.run_training.maybe_load_checkpoint). This script passes --c when
@@ -168,16 +195,18 @@ case "$TRAINER_FAMILY" in
     ;;
   ALT_OS033_INV)
     EPOCHS="${EPOCHS:-250}"
-    if [[ "$EPOCHS" != "250" && "$EPOCHS" != "500" ]]; then
-      echo "ERROR: with TRAINER=ALT_OS033_INV, EPOCHS must be 250 or 500 (got: $EPOCHS)" >&2
+    if [[ "$EPOCHS" != "250" ]]; then
+      echo "ERROR: TRAINER=ALT_OS033_INV only ships a 250-epoch class (got: $EPOCHS). " \
+           "See custom_trainers/nnUNetTrainerALT_inv.py — add a 500-epoch sibling there if needed." >&2
       exit 1
     fi
     TRAINER="nnUNetTrainerALT_os033_inv_${EPOCHS}epochs"
     ;;
   ALT_OS033_INVGAMMA)
     EPOCHS="${EPOCHS:-250}"
-    if [[ "$EPOCHS" != "250" && "$EPOCHS" != "500" ]]; then
-      echo "ERROR: with TRAINER=ALT_OS033_INVGAMMA, EPOCHS must be 250 or 500 (got: $EPOCHS)" >&2
+    if [[ "$EPOCHS" != "250" ]]; then
+      echo "ERROR: TRAINER=ALT_OS033_INVGAMMA only ships a 250-epoch class (got: $EPOCHS). " \
+           "See custom_trainers/nnUNetTrainerALT_inv.py — add a 500-epoch sibling there if needed." >&2
       exit 1
     fi
     TRAINER="nnUNetTrainerALT_os033_invgamma_${EPOCHS}epochs"
@@ -206,26 +235,60 @@ if (( _mode_count > 1 )); then
 fi
 FOLDS="${FOLDS:-0 1 2 3 4}"
 CONFIGS="${CONFIGS:-3d_fullres 2d}"
-if [[ "$T1_ONLY" == "1" ]]; then
-  DATASETS="${DATASETS:-501}"
-elif [[ "$T2_ONLY" == "1" ]]; then
-  DATASETS="${DATASETS:-502}"
-elif [[ "$T1T2" == "1" ]]; then
-  DATASETS="${DATASETS:-503}"
-else
-  DATASETS="${DATASETS:-501 502}"
+
+# Percentile-clipping A/B switch. When CLIP=1, the builders apply
+# _clip_percentiles(p_lo, p_hi) after _fix_intensity and write to the clipped
+# dataset ids (504/505/506) so the un-clipped baseline cache stays intact.
+CLIP="${CLIP:-0}"
+CLIP_P_LO="${CLIP_P_LO:-0.5}"
+CLIP_P_HI="${CLIP_P_HI:-99.5}"
+CLIP_BUILD_ARGS=()
+if [[ "$CLIP" == "1" ]]; then
+  CLIP_BUILD_ARGS=(--percentile-clip --clip-p-lo "$CLIP_P_LO" --clip-p-hi "$CLIP_P_HI")
 fi
-# Multichannel datasets (e.g. Dataset503_ALT_T1T2) cannot inherit TS-MRI plans
-# because TS is single-channel. Training always uses default nnUNetPlans and
-# no pretrained weights for those.
-MULTICHANNEL_DATASETS_RE="^(503)$"
+
+if [[ "$T1_ONLY" == "1" ]]; then
+  if [[ "$CLIP" == "1" ]]; then
+    DATASETS="${DATASETS:-505}"
+  else
+    DATASETS="${DATASETS:-501}"
+  fi
+elif [[ "$T2_ONLY" == "1" ]]; then
+  if [[ "$CLIP" == "1" ]]; then
+    DATASETS="${DATASETS:-506}"
+  else
+    DATASETS="${DATASETS:-502}"
+  fi
+elif [[ "$T1T2" == "1" ]]; then
+  if [[ "$CLIP" == "1" ]]; then
+    DATASETS="${DATASETS:-504}"
+  else
+    DATASETS="${DATASETS:-503}"
+  fi
+else
+  if [[ "$CLIP" == "1" ]]; then
+    DATASETS="${DATASETS:-505 506}"
+  else
+    DATASETS="${DATASETS:-501 502}"
+  fi
+fi
+# Multichannel datasets cannot inherit TS-MRI plans (TS is single-channel).
+# Training always uses default nnUNetPlans and no pretrained weights for those.
+# 504 = percentile-clipped sibling of 503.
+MULTICHANNEL_DATASETS_RE="^(503|504)$"
 # Fusion mode for the T1+T2 dataset builder. Only used when dataset 503 is in DATASETS.
 FUSION="${FUSION:-union}"
 TS_TASK_ID="${TS_TASK_ID:-852}"
 PYTHON="${PYTHON:-python3}"
 TORCH_CUDA="${TORCH_CUDA:-cu128}"
 
-HOLDOUT_CASES_FILE="${HOLDOUT_CASES_FILE:-}"
+# Default to repo-root holdout_cases.txt when present. Use ${VAR-default}
+# (no colon) so that an explicit `HOLDOUT_CASES_FILE=` opts out cleanly.
+if [[ -z "${HOLDOUT_CASES_FILE+x}" && -f "$here/holdout_cases.txt" ]]; then
+  HOLDOUT_CASES_FILE="holdout_cases.txt"
+else
+  HOLDOUT_CASES_FILE="${HOLDOUT_CASES_FILE-}"
+fi
 HOLDOUT_RESOLVED=""
 HOLDOUT_EXCLUDE_ARGS=()
 if [[ -n "$HOLDOUT_CASES_FILE" ]]; then
@@ -240,13 +303,21 @@ if [[ -n "$HOLDOUT_CASES_FILE" ]]; then
   fi
   HOLDOUT_EXCLUDE_ARGS=(--exclude-cases-file "$HOLDOUT_RESOLVED")
 fi
-RUN_HOLDOUT_EVAL="${RUN_HOLDOUT_EVAL:-0}"
+if [[ -n "$HOLDOUT_RESOLVED" ]]; then
+  RUN_HOLDOUT_EVAL="${RUN_HOLDOUT_EVAL:-1}"
+else
+  RUN_HOLDOUT_EVAL="${RUN_HOLDOUT_EVAL:-0}"
+fi
 HOLDOUT_GATE_MODE="${HOLDOUT_GATE_MODE:-sigmoid}"
 HOLDOUT_VMIN="${HOLDOUT_VMIN:-1000}"
 HOLDOUT_TAU="${HOLDOUT_TAU:-20}"
 HOLDOUT_USE_CONF="${HOLDOUT_USE_CONF:-1}"
 HOLDOUT_MIN_RATIO="${HOLDOUT_MIN_RATIO:-0.1}"
 HOLDOUT_GATED_OUT_NAME="${HOLDOUT_GATED_OUT_NAME:-holdout_eval}"
+
+# v2c gated ensemble on per-fold CV outputs (default on).
+RUN_CV_GATED="${RUN_CV_GATED:-1}"
+CV_GATED_OUT_NAME="${CV_GATED_OUT_NAME:-v2c_cv}"
 
 NUM_GPUS="${NUM_GPUS:-1}"
 if [[ "$NUM_GPUS" != "1" && "$NUM_GPUS" != "2" ]]; then
@@ -306,6 +377,7 @@ echo "   Epochs:         $EPOCHS"
 echo "   T1_ONLY:        $T1_ONLY"
 echo "   T2_ONLY:        $T2_ONLY"
 echo "   T1T2:           $T1T2  (fusion=$FUSION)"
+echo "   CLIP:           $CLIP  (p_lo=$CLIP_P_LO, p_hi=$CLIP_P_HI)"
 echo "   Folds:          $FOLDS"
 echo "   Configs:        $CONFIGS"
 echo "   Datasets:       $DATASETS"
@@ -315,6 +387,7 @@ echo "   TS MRI task:    $TS_TASK_ID"
 echo "   NUM_GPUS:       $NUM_GPUS  (gpu ids: ${GPU_IDS_ARR[*]})"
 echo "   CPU threads:    nproc=$NCPU phys=$NCPU_PHYS -> per-proc=$PER_PROC_THREADS, DA workers=$DA_PROCS"
 echo "   torch.compile:  $_NNUNET_COMPILE_ENV  (NNUNET_COMPILE=$NNUNET_COMPILE)"
+echo "   CV gated (v2c): $RUN_CV_GATED  (out_name=$CV_GATED_OUT_NAME)"
 if [[ -n "$HOLDOUT_RESOLVED" ]]; then
   echo "   Holdout file:   $HOLDOUT_RESOLVED"
   echo "   Run holdout eval: $RUN_HOLDOUT_EVAL"
@@ -401,8 +474,13 @@ PY
 # fresh node: nnUNet_raw is rsync'd in, but the original T1/IOG* dirs
 # stay on the source machine).
 if [[ "$T1T2" == "1" ]]; then
-  RAW_MARKER="$nnUNet_raw/Dataset503_ALT_T1T2/dataset.json"
-  T1T2_RAW_DIR="$nnUNet_raw/Dataset503_ALT_T1T2"
+  if [[ "$CLIP" == "1" ]]; then
+    T1T2_DS_NAME="Dataset504_ALT_T1T2_clip"
+  else
+    T1T2_DS_NAME="Dataset503_ALT_T1T2"
+  fi
+  RAW_MARKER="$nnUNet_raw/$T1T2_DS_NAME/dataset.json"
+  T1T2_RAW_DIR="$nnUNet_raw/$T1T2_DS_NAME"
   SRC_DIR="$here/T1"  # build_t1t2_dataset.py requires BOTH T1/ and T2/
   FORCE_T1T2_BUILD="${FORCE_T1T2_BUILD:-0}"
   T1T2_HAS_IMAGES=0
@@ -435,11 +513,12 @@ if [[ "$T1T2" == "1" ]]; then
     echo "[data] hint: set FORCE_T1T2_BUILD=1 after changing T1/ T2/ or FUSION to force a full rebuild."
   else
     if [[ "$FORCE_T1T2_BUILD" == "1" ]]; then
-      echo "[data] FORCE_T1T2_BUILD=1 -> rebuilding 2-channel Dataset503_ALT_T1T2 (fusion=$FUSION)"
+      echo "[data] FORCE_T1T2_BUILD=1 -> rebuilding 2-channel $T1T2_DS_NAME (fusion=$FUSION, clip=$CLIP)"
     else
-      echo "[data] building 2-channel Dataset503_ALT_T1T2 (fusion=$FUSION)"
+      echo "[data] building 2-channel $T1T2_DS_NAME (fusion=$FUSION, clip=$CLIP)"
     fi
-    python scripts/build_t1t2_dataset.py --fusion "$FUSION" "${HOLDOUT_EXCLUDE_ARGS[@]}"
+    python scripts/build_t1t2_dataset.py --fusion "$FUSION" \
+      "${CLIP_BUILD_ARGS[@]}" "${HOLDOUT_EXCLUDE_ARGS[@]}"
     echo "$FUSION" > "$T1T2_RAW_DIR/.fusion_mode"
   fi
 else
@@ -450,17 +529,26 @@ else
     CONVERT_ARGS+=("--t2-only")
   fi
   if [[ "$T2_ONLY" == "1" ]]; then
-    RAW_MARKER="$nnUNet_raw/Dataset502_ALT_T2/dataset.json"
+    if [[ "$CLIP" == "1" ]]; then
+      RAW_MARKER="$nnUNet_raw/Dataset506_ALT_T2_clip/dataset.json"
+    else
+      RAW_MARKER="$nnUNet_raw/Dataset502_ALT_T2/dataset.json"
+    fi
     SRC_DIR="$here/T2"
   else
-    RAW_MARKER="$nnUNet_raw/Dataset501_ALT_T1/dataset.json"
+    if [[ "$CLIP" == "1" ]]; then
+      RAW_MARKER="$nnUNet_raw/Dataset505_ALT_T1_clip/dataset.json"
+    else
+      RAW_MARKER="$nnUNet_raw/Dataset501_ALT_T1/dataset.json"
+    fi
     SRC_DIR="$here/T1"
   fi
   if [[ -f "$RAW_MARKER" && ! -d "$SRC_DIR" ]]; then
     echo "[data] nnUNet_raw already populated and $(basename "$SRC_DIR")/ source missing -> skipping convert_to_nnunet.py"
   else
-    echo "[data] converting raw patient folders to nnU-Net raw datasets"
-    python scripts/convert_to_nnunet.py "${CONVERT_ARGS[@]}" "${HOLDOUT_EXCLUDE_ARGS[@]}"
+    echo "[data] converting raw patient folders to nnU-Net raw datasets (clip=$CLIP)"
+    python scripts/convert_to_nnunet.py "${CONVERT_ARGS[@]}" \
+      "${CLIP_BUILD_ARGS[@]}" "${HOLDOUT_EXCLUDE_ARGS[@]}"
   fi
 fi
 
@@ -488,26 +576,35 @@ fi
 # on single-channel datasets). Multichannel datasets (e.g. 503) only get
 # nnUNetPlans; see prepare_pretrain_plans.py.
 # Skip if plans + preprocessed shards are already on disk (migration case).
-PREPARE_ARGS=()
-if [[ "$T1_ONLY" == "1" ]]; then
-  PREPARE_ARGS+=("--t1-only")
-elif [[ "$T2_ONLY" == "1" ]]; then
-  PREPARE_ARGS+=("--t2-only")
-elif [[ "$T1T2" == "1" ]]; then
-  PREPARE_ARGS+=("--t1t2-only")
-fi
-if [[ "$T2_ONLY" == "1" ]]; then
-  PREP_DIR="$nnUNet_preprocessed/Dataset502_ALT_T2"
-  PREP_NEEDS_TS=1
-elif [[ "$T1T2" == "1" ]]; then
-  PREP_DIR="$nnUNet_preprocessed/Dataset503_ALT_T1T2"
-  PREP_NEEDS_TS=0
-else
-  PREP_DIR="$nnUNet_preprocessed/Dataset501_ALT_T1"
-  PREP_NEEDS_TS=1
-fi
-# Multichannel 503: if fusion mode changed since last preprocess, drop cache so
-# nnUNetPlans.json and gt_segmentations are regenerated from the new labels.
+# Resolve `Dataset<id>_*` folder name by globbing nnUNet_raw. Centralises the
+# dataset-id -> folder-name mapping so we don't enumerate 501/502/503/504/...
+_ds_folder_name() {
+  local D="$1" base="$2"
+  shopt -s nullglob
+  local m=("$base"/Dataset"${D}"_*)
+  shopt -u nullglob
+  if ((${#m[@]} != 1)); then
+    return 1
+  fi
+  basename "${m[0]}"
+}
+
+PREPARE_ARGS=(--datasets $DATASETS)
+PREP_DIR=""
+PREP_NEEDS_TS=0
+for D in $DATASETS; do
+  if [[ "$D" =~ $MULTICHANNEL_DATASETS_RE ]]; then
+    _ds_needs_ts=0
+  else
+    _ds_needs_ts=1
+    PREP_NEEDS_TS=1
+  fi
+  if _name=$(_ds_folder_name "$D" "$nnUNet_raw"); then
+    PREP_DIR="$nnUNet_preprocessed/$_name"
+  fi
+done
+# Multichannel (503/504): if fusion mode changed since last preprocess, drop
+# cache so nnUNetPlans.json and gt_segmentations are regenerated.
 if [[ "$T1T2" == "1" && -d "$PREP_DIR" ]]; then
   _prep_fusion_stamp="$PREP_DIR/.fusion_mode"
   if [[ ! -f "$_prep_fusion_stamp" ]]; then
@@ -523,12 +620,11 @@ fi
 if [[ -n "$HOLDOUT_RESOLVED" ]]; then
   _holdout_hash="$(sha256sum "$HOLDOUT_RESOLVED" | awk '{print $1}')"
   for D in $DATASETS; do
-    case "$D" in
-      501) _hd_prep="$nnUNet_preprocessed/Dataset501_ALT_T1" ;;
-      502) _hd_prep="$nnUNet_preprocessed/Dataset502_ALT_T2" ;;
-      503) _hd_prep="$nnUNet_preprocessed/Dataset503_ALT_T1T2" ;;
-      *) continue ;;
-    esac
+    if _name=$(_ds_folder_name "$D" "$nnUNet_raw"); then
+      _hd_prep="$nnUNet_preprocessed/$_name"
+    else
+      continue
+    fi
     if [[ -d "$_hd_prep" ]]; then
       if [[ ! -f "$_hd_prep/.holdout_stamp" ]] || [[ "$(cat "$_hd_prep/.holdout_stamp")" != "$_holdout_hash" ]]; then
         echo "[plan] holdout list new/changed vs $_hd_prep/.holdout_stamp -> removing $_hd_prep"
@@ -550,19 +646,18 @@ if [[ "$PREP_HAS_DEFAULT" == "1" && ( "$PREP_NEEDS_TS" == "0" || "$PREP_HAS_TS" 
 else
   echo "[plan] planning + preprocessing datasets"
   python scripts/prepare_pretrain_plans.py "${PREPARE_ARGS[@]}"
-  if [[ "$T1T2" == "1" && -d "$PREP_DIR" && -f "$nnUNet_raw/Dataset503_ALT_T1T2/.fusion_mode" ]]; then
-    cp "$nnUNet_raw/Dataset503_ALT_T1T2/.fusion_mode" "$PREP_DIR/.fusion_mode"
+  if [[ "$T1T2" == "1" && -d "$PREP_DIR" && -f "$nnUNet_raw/$T1T2_DS_NAME/.fusion_mode" ]]; then
+    cp "$nnUNet_raw/$T1T2_DS_NAME/.fusion_mode" "$PREP_DIR/.fusion_mode"
     echo "[plan] stamped $PREP_DIR/.fusion_mode <- $(cat "$PREP_DIR/.fusion_mode")"
   fi
   if [[ -n "$HOLDOUT_RESOLVED" ]]; then
     _holdout_hash="$(sha256sum "$HOLDOUT_RESOLVED" | awk '{print $1}')"
     for D in $DATASETS; do
-      case "$D" in
-        501) _dstamp="$nnUNet_preprocessed/Dataset501_ALT_T1" ;;
-        502) _dstamp="$nnUNet_preprocessed/Dataset502_ALT_T2" ;;
-        503) _dstamp="$nnUNet_preprocessed/Dataset503_ALT_T1T2" ;;
-        *) continue ;;
-      esac
+      if _name=$(_ds_folder_name "$D" "$nnUNet_raw"); then
+        _dstamp="$nnUNet_preprocessed/$_name"
+      else
+        continue
+      fi
       if [[ -d "$_dstamp" ]]; then
         echo "$_holdout_hash" > "$_dstamp/.holdout_stamp"
         echo "[plan] wrote $_dstamp/.holdout_stamp"
@@ -676,6 +771,12 @@ train_one() {
   return "${PIPESTATUS[0]}"
 }
 
+# Build a flat queue of (dataset, config, fold, plans, pretrain_key) units across
+# the full {DATASETS} x {CONFIGS} x {FOLDS} cartesian product. The queue lets us
+# pair across configs / datasets so the scheduler stays full when |FOLDS| is
+# odd: with NUM_GPUS=2 and the default 5 folds x 2 configs x 1 dataset = 10
+# units, the pairing is always perfect (no GPU sits idle for a final solo fold).
+JOBS=()
 for D in $DATASETS; do
   D_MULTICHANNEL=0
   if [[ "$D" =~ $MULTICHANNEL_DATASETS_RE ]]; then
@@ -683,53 +784,114 @@ for D in $DATASETS; do
   fi
   for C in $CONFIGS; do
     if [[ "$C" == "3d_fullres" && "$D_MULTICHANNEL" == "0" ]]; then
-      PLANS="nnUNetTSMRIPlans"
+      JPLANS="nnUNetTSMRIPlans"
+      JPK="ts"
+    else
+      JPLANS="nnUNetPlans"
+      JPK="none"
+    fi
+    for F in $FOLDS; do
+      JOBS+=("${D}|${C}|${F}|${JPLANS}|${JPK}")
+    done
+  done
+done
+echo "[sched] queued ${#JOBS[@]} training units across $DATASETS x $CONFIGS x folds=[$FOLDS]"
+
+if [[ "$NUM_GPUS" == "1" ]]; then
+  for job in "${JOBS[@]}"; do
+    IFS='|' read -r D C F PLANS PK <<<"$job"
+    if [[ "$PK" == "ts" ]]; then
       PRETRAIN_ARGS=(-pretrained_weights "$TS_CKPT")
     else
-      # 2d config, or any config on a multichannel dataset.
-      PLANS="nnUNetPlans"
+      PRETRAIN_ARGS=()
+    fi
+    echo ""
+    train_one "$D" "$C" "$F" "$PLANS" "${GPU_IDS_ARR[0]}" "${PRETRAIN_ARGS[@]}"
+  done
+else
+  # 2-slot work-stealing scheduler keyed by GPU id. Whenever both GPUs are
+  # busy we wait for any one to finish (`wait -n`, bash 4.3+) and dispatch
+  # the next queued unit on the freed GPU.
+  declare -A SLOT_PID SLOT_DESC
+
+  _drain_one() {
+    # Block until ANY background slot finishes; reap every slot whose pid is
+    # no longer alive; return non-zero if any reaped slot exited non-zero.
+    set +e
+    wait -n
+    set -e
+    local gpu p rc fail=0
+    for gpu in "${!SLOT_PID[@]}"; do
+      p="${SLOT_PID[$gpu]}"
+      if ! kill -0 "$p" 2>/dev/null; then
+        set +e; wait "$p"; rc=$?; set -e
+        local desc="${SLOT_DESC[$gpu]}"
+        unset "SLOT_PID[$gpu]"
+        unset "SLOT_DESC[$gpu]"
+        if (( rc != 0 )); then
+          echo "ERROR: training failed: $desc (rc=$rc)" >&2
+          fail=1
+        fi
+      fi
+    done
+    return $fail
+  }
+
+  _drain_remaining_and_die() {
+    while (( ${#SLOT_PID[@]} > 0 )); do
+      _drain_one || true
+    done
+    exit 1
+  }
+
+  _pick_free_gpu() {
+    local i gpu
+    for (( i=0; i<NUM_GPUS; i++ )); do
+      gpu="${GPU_IDS_ARR[$i]}"
+      if [[ -z "${SLOT_PID[$gpu]:-}" ]]; then
+        echo "$gpu"
+        return 0
+      fi
+    done
+    return 1
+  }
+
+  for job in "${JOBS[@]}"; do
+    IFS='|' read -r D C F PLANS PK <<<"$job"
+    if [[ "$PK" == "ts" ]]; then
+      PRETRAIN_ARGS=(-pretrained_weights "$TS_CKPT")
+    else
       PRETRAIN_ARGS=()
     fi
 
-    FOLDS_ARR=($FOLDS)
-    if [[ "$NUM_GPUS" == "1" ]]; then
-      for F in "${FOLDS_ARR[@]}"; do
-        echo ""
-        train_one "$D" "$C" "$F" "$PLANS" "${GPU_IDS_ARR[0]}" "${PRETRAIN_ARGS[@]}"
-      done
-    else
-      # Pair folds two at a time, one per GPU.
-      for (( i=0; i<${#FOLDS_ARR[@]}; i+=2 )); do
-        F1="${FOLDS_ARR[i]}"
-        F2="${FOLDS_ARR[i+1]:-}"
-        echo ""
-        train_one "$D" "$C" "$F1" "$PLANS" "${GPU_IDS_ARR[0]}" "${PRETRAIN_ARGS[@]}" &
-        PID1=$!
-        if [[ -n "$F2" ]]; then
-          train_one "$D" "$C" "$F2" "$PLANS" "${GPU_IDS_ARR[1]}" "${PRETRAIN_ARGS[@]}" &
-          PID2=$!
-          set +e
-          wait "$PID1"; RET1=$?
-          wait "$PID2"; RET2=$?
-          set -e
-          if (( RET1 != 0 || RET2 != 0 )); then
-            echo "ERROR: parallel training failed (gpu${GPU_IDS_ARR[0]} fold $F1 -> $RET1, gpu${GPU_IDS_ARR[1]} fold $F2 -> $RET2)" >&2
-            exit 1
-          fi
-        else
-          # Odd fold left over, run alone on the first GPU.
-          set +e
-          wait "$PID1"; RET1=$?
-          set -e
-          if (( RET1 != 0 )); then
-            echo "ERROR: training failed (gpu${GPU_IDS_ARR[0]} fold $F1 -> $RET1)" >&2
-            exit 1
-          fi
-        fi
-      done
-    fi
+    # Block until a GPU is free.
+    while ! gpu=$(_pick_free_gpu); do
+      _drain_one || _drain_remaining_and_die
+    done
+
+    echo ""
+    train_one "$D" "$C" "$F" "$PLANS" "$gpu" "${PRETRAIN_ARGS[@]}" &
+    SLOT_PID[$gpu]=$!
+    SLOT_DESC[$gpu]="gpu${gpu} d=${D} c=${C} f=${F}"
   done
-done
+
+  # Drain whatever is still running.
+  while (( ${#SLOT_PID[@]} > 0 )); do
+    _drain_one || _drain_remaining_and_die
+  done
+fi
+
+# Helper used by the find_best loop, the CV gated block, and the holdout block.
+nnunet_one_raw_dataset_dir() {
+  local D="$1"
+  shopt -s nullglob
+  local m=("$nnUNet_raw"/Dataset"${D}"_*)
+  shopt -u nullglob
+  if ((${#m[@]} != 1)); then
+    return 1
+  fi
+  printf '%s' "${m[0]}"
+}
 
 # 8. Pick the best configuration (and emit inference commands) per dataset
 for D in $DATASETS; do
@@ -747,18 +909,42 @@ for D in $DATASETS; do
     -f $FOLDS || true
 done
 
-# 9. Optional holdout: nnUNetv2_predict (2d + 3d_fullres) + gated ensemble on flat dirs.
-nnunet_one_raw_dataset_dir() {
-  local D="$1"
-  shopt -s nullglob
-  local m=("$nnUNet_raw"/Dataset"${D}"_*)
-  shopt -u nullglob
-  if ((${#m[@]} != 1)); then
-    return 1
-  fi
-  printf '%s' "${m[0]}"
-}
+# 8b. v2c gated ensemble on per-fold CV outputs (sigmoid + confidence).
+# Single-channel datasets only: multichannel 503 keeps the holdout-only gating
+# below since its 3D plans are nnUNetPlans (no TS-MRI), and the per-fold ensemble
+# folder layout differs.
+if [[ "$RUN_CV_GATED" == "1" ]]; then
+  echo ""
+  echo "---- v2c gated ensemble on CV (RUN_CV_GATED=1) ----"
+  for D in $DATASETS; do
+    if [[ "$D" =~ $MULTICHANNEL_DATASETS_RE ]]; then
+      echo "[cv-gated] skip dataset $D (multichannel; gated path runs at holdout time only)"
+      continue
+    fi
+    raw_ds="$(nnunet_one_raw_dataset_dir "$D")" || {
+      echo "[cv-gated] WARN: skip $D: could not resolve nnUNet_raw/Dataset${D}_*"
+      continue
+    }
+    ds_name="$(basename "$raw_ds")"
+    echo "[cv-gated] dataset=$D ($ds_name) -> gated_ensemble_${CV_GATED_OUT_NAME}/"
+    python scripts/ensemble_gated.py \
+      --dataset "$ds_name" \
+      --trainer "$TRAINER" \
+      --plans-2d nnUNetPlans \
+      --plans-3d nnUNetTSMRIPlans \
+      --config-2d 2d \
+      --config-3d 3d_fullres \
+      --folds "$FOLDS" \
+      --gate-mode sigmoid \
+      --tau 20 \
+      --min-fg-voxels 1000 \
+      --use-confidence \
+      --out-name "$CV_GATED_OUT_NAME" || \
+      echo "[cv-gated] WARN: ensemble_gated.py failed for $ds_name (continuing)"
+  done
+fi
 
+# 9. Optional holdout: nnUNetv2_predict (2d + 3d_fullres) + gated ensemble on flat dirs.
 if [[ "$RUN_HOLDOUT_EVAL" == "1" ]]; then
   echo ""
   echo "---- holdout inference + gated eval (RUN_HOLDOUT_EVAL=1) ----"

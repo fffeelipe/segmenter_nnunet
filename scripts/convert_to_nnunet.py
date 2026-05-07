@@ -32,16 +32,47 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import subprocess
 import sys
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 
 import numpy as np
 import SimpleITK as sitk
 
 
+def _guess_physical_cores() -> int:
+    """Best-effort estimate of physical core count (Linux), else fallback."""
+    try:
+        out = subprocess.check_output(["lscpu", "-p=Core,Socket"], text=True)
+        cores = set()
+        for line in out.splitlines():
+            if not line or line.startswith("#"):
+                continue
+            core, sock = line.split(",")[:2]
+            cores.add((core.strip(), sock.strip()))
+        if cores:
+            return int(len(cores))
+    except Exception:
+        pass
+    return int(os.cpu_count() or 1)
+
+
+def _default_workers() -> int:
+    phys = max(1, _guess_physical_cores())
+    return max(1, phys // 2)
+
+
 DATASETS = {
     "T1": ("Dataset501_ALT_T1", "T1"),
     "T2": ("Dataset502_ALT_T2", "T2"),
+}
+
+# Clipped variants written when --percentile-clip is set. Distinct dataset ids
+# so the un-clipped baseline preprocessed cache stays intact for A/B.
+DATASETS_CLIP = {
+    "T1": ("Dataset505_ALT_T1_clip", "T1"),
+    "T2": ("Dataset506_ALT_T2_clip", "T2"),
 }
 
 
@@ -163,6 +194,45 @@ def align_label_to_image(
     return resampled
 
 
+def _clip_percentiles(
+    img: sitk.Image,
+    *,
+    p_lo: float = 0.5,
+    p_hi: float = 99.5,
+    case_id: str = "",
+) -> sitk.Image:
+    """Clip image intensities at the given percentiles.
+
+    Designed to remove the upper-tail spikes / scanner uint12 ceiling
+    artifacts surfaced by ``reports/{t1,t2}_intensity_audit.csv``: several
+    cases hit ``max=4095`` (uint12 clamp), which inflates the apparent
+    dynamic range and degrades z-score normalisation. Percentile clipping
+    leaves the bulk of the distribution alone but caps the top/bottom
+    fractions of voxels at their respective percentile values.
+
+    Defaults (0.5 / 99.5) match the canonical nnU-Net CT clipping recipe
+    and the ``ANALYSIS.md §3`` follow-up. Pass different values to A/B.
+    """
+    arr = sitk.GetArrayFromImage(img)
+    lo, hi = float(np.percentile(arr, p_lo)), float(np.percentile(arr, p_hi))
+    if not np.isfinite(lo) or not np.isfinite(hi) or hi <= lo:
+        return img
+    n_lo = int((arr < lo).sum())
+    n_hi = int((arr > hi).sum())
+    if n_lo == 0 and n_hi == 0:
+        return img
+    tag = f"[{case_id}] " if case_id else ""
+    print(
+        f"  {tag}percentile clip "
+        f"(p{p_lo:g}={lo:.1f}, p{p_hi:g}={hi:.1f}): "
+        f"low_clipped={n_lo}, high_clipped={n_hi}"
+    )
+    out_arr = np.clip(arr, lo, hi).astype(arr.dtype, copy=False)
+    out = sitk.GetImageFromArray(out_arr)
+    out.CopyInformation(img)
+    return out
+
+
 def _fix_intensity(img: sitk.Image, case_id: str = "") -> sitk.Image:
     """Repair intensity-range artifacts from DICOM/NIfTI conversion.
 
@@ -211,15 +281,94 @@ def _fix_intensity(img: sitk.Image, case_id: str = "") -> sitk.Image:
     return out
 
 
+def _convert_one_case(
+    case_dir: str,
+    modality_dir: str,
+    images_dir: str,
+    labels_dir: str,
+    holdout_img: str,
+    holdout_lbl: str,
+    *,
+    is_holdout: bool,
+    clip_p_lo: float | None,
+    clip_p_hi: float | None,
+) -> dict:
+    """Worker entrypoint: convert a single patient.
+
+    Returns a dict with keys ``case_id``, ``status`` ("train" | "holdout" |
+    "no_pair"), and ``image`` / ``label`` source filenames for logging.
+    Errors during ``align_label_to_image`` are re-raised with the case id
+    embedded so the parent's ``future.result()`` surfaces them clearly.
+    """
+    case_dir_p = Path(case_dir)
+    case_id = case_dir_p.name
+    pair = find_pair(case_dir_p)
+    if pair is None:
+        return {"case_id": case_id, "status": "no_pair"}
+
+    image_src, label_src = pair
+    img = sitk.ReadImage(str(image_src))
+    img = _fix_intensity(img, case_id=f"{modality_dir}/{case_id}")
+    if clip_p_lo is not None and clip_p_hi is not None:
+        img = _clip_percentiles(
+            img, p_lo=clip_p_lo, p_hi=clip_p_hi,
+            case_id=f"{modality_dir}/{case_id}",
+        )
+
+    lbl = sitk.ReadImage(str(label_src))
+    try:
+        lbl_bin = align_label_to_image(
+            lbl, reference_img=img, case_id=f"{modality_dir}/{case_id}"
+        )
+    except ValueError as exc:
+        raise ValueError(f"[{modality_dir}] {case_id}: {exc}") from exc
+
+    if is_holdout:
+        Path(holdout_img).mkdir(parents=True, exist_ok=True)
+        Path(holdout_lbl).mkdir(parents=True, exist_ok=True)
+        sitk.WriteImage(img, str(Path(holdout_img) / f"{case_id}_0000.nii.gz"))
+        sitk.WriteImage(lbl_bin, str(Path(holdout_lbl) / f"{case_id}.nii.gz"))
+        return {
+            "case_id": case_id, "status": "holdout",
+            "image": image_src.name, "label": label_src.name,
+        }
+    else:
+        sitk.WriteImage(img, str(Path(images_dir) / f"{case_id}_0000.nii.gz"))
+        sitk.WriteImage(lbl_bin, str(Path(labels_dir) / f"{case_id}.nii.gz"))
+        return {
+            "case_id": case_id, "status": "train",
+            "image": image_src.name, "label": label_src.name,
+        }
+
+
 def convert_modality(
     src_root: Path,
     dst_root: Path,
     modality_dir: str,
     *,
     exclude_cases: set[str] | None = None,
+    clip_p_lo: float | None = None,
+    clip_p_hi: float | None = None,
+    workers: int = 1,
 ) -> tuple[int, int]:
-    """Convert one modality. Returns ``(n_train, n_holdout)``."""
-    ds_name, channel_name = DATASETS[modality_dir]
+    """Convert one modality. Returns ``(n_train, n_holdout)``.
+
+    When ``clip_p_lo`` / ``clip_p_hi`` are set, intensities are clipped at
+    those percentiles after ``_fix_intensity`` and written under the
+    ``DATASETS_CLIP`` dataset id (``Dataset505_*`` / ``Dataset506_*``) so
+    the un-clipped baseline cache stays intact.
+
+    When ``workers > 1`` patients are processed in a ``ProcessPoolExecutor``;
+    each worker writes its own outputs atomically. Per-case stdout may
+    interleave but is prefixed with ``[<modality>] <case>`` so it stays
+    readable. Stays single-process when ``workers == 1`` to keep tracebacks
+    direct for debugging.
+    """
+    use_clip = clip_p_lo is not None and clip_p_hi is not None
+    if use_clip:
+        ds_name, channel_name = DATASETS_CLIP[modality_dir]
+    else:
+        ds_name, channel_name = DATASETS[modality_dir]
     dst = dst_root / ds_name
     images_dir = dst / "imagesTr"
     labels_dir = dst / "labelsTr"
@@ -240,41 +389,69 @@ def convert_modality(
     n_holdout = 0
     skipped: list[str] = []
 
-    for p in patients:
-        pair = find_pair(p)
-        if pair is None:
-            skipped.append(p.name)
-            continue
-        image_src, label_src = pair
-        case_id = p.name
-        seen_ids.add(case_id)
-
-        img = sitk.ReadImage(str(image_src))
-        img = _fix_intensity(img, case_id=f"{modality_dir}/{case_id}")
-
-        lbl = sitk.ReadImage(str(label_src))
-        try:
-            lbl_bin = align_label_to_image(
-                lbl, reference_img=img, case_id=f"{modality_dir}/{case_id}"
+    workers = max(1, int(workers))
+    if workers > 1:
+        print(f"[{modality_dir}] converting {len(patients)} patients with {workers} workers")
+        with ProcessPoolExecutor(max_workers=workers) as ex:
+            futs = {
+                ex.submit(
+                    _convert_one_case,
+                    str(p),
+                    modality_dir,
+                    str(images_dir),
+                    str(labels_dir),
+                    str(holdout_img),
+                    str(holdout_lbl),
+                    is_holdout=p.name in exclude_cases,
+                    clip_p_lo=clip_p_lo,
+                    clip_p_hi=clip_p_hi,
+                ): p.name
+                for p in patients
+            }
+            for fut in as_completed(futs):
+                case_id = futs[fut]
+                res = fut.result()  # re-raises ValueError with case id embedded
+                status = res["status"]
+                if status == "no_pair":
+                    skipped.append(case_id)
+                    continue
+                seen_ids.add(case_id)
+                if status == "holdout":
+                    n_holdout += 1
+                    print(
+                        f"  [{modality_dir}] {case_id}: HOLDOUT -> holdout/ "
+                        f"image={res['image']} label={res['label']}"
+                    )
+                else:
+                    n_train += 1
+                    print(f"  [{modality_dir}] {case_id}: image={res['image']} label={res['label']}")
+    else:
+        for p in patients:
+            res = _convert_one_case(
+                str(p),
+                modality_dir,
+                str(images_dir),
+                str(labels_dir),
+                str(holdout_img),
+                str(holdout_lbl),
+                is_holdout=p.name in exclude_cases,
+                clip_p_lo=clip_p_lo,
+                clip_p_hi=clip_p_hi,
             )
-        except ValueError as exc:
-            raise ValueError(f"[{modality_dir}] {case_id}: {exc}") from exc
-
-        if case_id in exclude_cases:
-            holdout_img.mkdir(parents=True, exist_ok=True)
-            holdout_lbl.mkdir(parents=True, exist_ok=True)
-            sitk.WriteImage(img, str(holdout_img / f"{case_id}_0000.nii.gz"))
-            sitk.WriteImage(lbl_bin, str(holdout_lbl / f"{case_id}.nii.gz"))
-            n_holdout += 1
-            print(
-                f"  [{modality_dir}] {case_id}: HOLDOUT -> holdout/ "
-                f"image={image_src.name} label={label_src.name}"
-            )
-        else:
-            sitk.WriteImage(img, str(images_dir / f"{case_id}_0000.nii.gz"))
-            sitk.WriteImage(lbl_bin, str(labels_dir / f"{case_id}.nii.gz"))
-            n_train += 1
-            print(f"  [{modality_dir}] {case_id}: image={image_src.name} label={label_src.name}")
+            status = res["status"]
+            if status == "no_pair":
+                skipped.append(p.name)
+                continue
+            seen_ids.add(p.name)
+            if status == "holdout":
+                n_holdout += 1
+                print(
+                    f"  [{modality_dir}] {p.name}: HOLDOUT -> holdout/ "
+                    f"image={res['image']} label={res['label']}"
+                )
+            else:
+                n_train += 1
+                print(f"  [{modality_dir}] {p.name}: image={res['image']} label={res['label']}")
 
     unknown = sorted(exclude_cases - seen_ids)
     if unknown:
@@ -340,6 +517,38 @@ def main() -> int:
             "dataset/holdout/{images,labels}/, excluded from imagesTr/labelsTr."
         ),
     )
+    parser.add_argument(
+        "--percentile-clip",
+        action="store_true",
+        help=(
+            "Apply percentile intensity clipping (p_lo=0.5, p_hi=99.5 by "
+            "default) after _fix_intensity. Writes to Dataset505_ALT_T1_clip "
+            "/ Dataset506_ALT_T2_clip so the un-clipped baseline cache "
+            "(Dataset501/502) stays intact for A/B."
+        ),
+    )
+    parser.add_argument(
+        "--clip-p-lo",
+        type=float,
+        default=0.5,
+        help="Lower percentile for --percentile-clip (default 0.5).",
+    )
+    parser.add_argument(
+        "--clip-p-hi",
+        type=float,
+        default=99.5,
+        help="Upper percentile for --percentile-clip (default 99.5).",
+    )
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=_default_workers(),
+        help=(
+            "Number of parallel worker processes for per-patient conversion "
+            "(default: auto ~ half physical cores). Set to 1 to keep the "
+            "single-process loop (clearer tracebacks)."
+        ),
+    )
     args = parser.parse_args()
     if args.t1_only and args.t2_only:
         raise SystemExit("--t1-only and --t2-only are mutually exclusive")
@@ -367,8 +576,18 @@ def main() -> int:
         exclude = load_exclude_case_ids(args.exclude_cases_file)
     total_train = 0
     total_holdout = 0
+    clip_kwargs = (
+        {"clip_p_lo": args.clip_p_lo, "clip_p_hi": args.clip_p_hi}
+        if args.percentile_clip
+        else {}
+    )
     for modality in modalities:
-        tr, ho = convert_modality(args.src, dst, modality, exclude_cases=exclude)
+        tr, ho = convert_modality(
+            args.src, dst, modality,
+            exclude_cases=exclude,
+            workers=args.workers,
+            **clip_kwargs,
+        )
         total_train += tr
         total_holdout += ho
     print(

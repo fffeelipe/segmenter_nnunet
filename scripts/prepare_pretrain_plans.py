@@ -35,7 +35,8 @@ TARGET_PLANS = "nnUNetTSMRIPlans"
 # Datasets whose input channel count differs from TS-MRI (1-ch). For these
 # we only produce the default nnUNetPlans; move_plans_between_datasets
 # from 850 would emit an unusable network.
-MULTICHANNEL_DATASETS = {503}
+# Dataset504 is the percentile-clipped sibling of 503 (same 2-channel layout).
+MULTICHANNEL_DATASETS = {503, 504}
 
 
 def run(cmd: list[str]) -> None:

@@ -28,8 +28,11 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import csv
+import datetime as _dt
 import json
 import os
+import random
 import re
 import sys
 from collections import defaultdict
@@ -100,6 +103,124 @@ def stratified_folds_from_groups(
     return folds
 
 
+def _load_contrast_csv(path: Path) -> dict[str, float]:
+    """Load patient-key -> contrast value from a CSV with columns
+    ``case,contrast`` (extra columns ignored). Empty / non-numeric rows are
+    skipped silently; the caller falls back to volume-only stratification
+    when not enough patients have a value.
+    """
+    out: dict[str, float] = {}
+    with open(path, newline="") as fh:
+        reader = csv.DictReader(fh)
+        if "case" not in reader.fieldnames or "contrast" not in reader.fieldnames:
+            raise SystemExit(
+                f"contrast CSV must have 'case' and 'contrast' columns, got: {reader.fieldnames}"
+            )
+        for row in reader:
+            cid = (row.get("case") or "").strip()
+            raw = (row.get("contrast") or "").strip()
+            if not cid or not raw:
+                continue
+            try:
+                out[cid] = float(raw)
+            except ValueError:
+                continue
+    return out
+
+
+def pick_stratified_holdout(
+    groups: list[tuple[str, list[str], int]],
+    *,
+    n: int = 7,
+    contrast_by_key: dict[str, float] | None = None,
+    seed: int = 20260507,
+) -> tuple[list[str], dict]:
+    """Pick ``n`` patient keys stratified by volume quartile (and contrast
+    bin when ``contrast_by_key`` is provided).
+
+    Strategy:
+      * Sort groups by ``vol_max`` and split into 4 quartile bins.
+      * If contrast info covers all keys, split each quartile into
+        low/high vs the global median contrast (8 cells total). Otherwise
+        use volume-only (4 cells).
+      * Round-robin pick one random group from each non-empty cell
+        (seeded), repeating cells until ``n`` picks are collected.
+
+    Returns ``(picked_keys, recipe_meta)``. ``picked_keys`` is the list of
+    patient keys (e.g. ``IOG41``); ``recipe_meta`` documents the cells and
+    their assignments for the file header.
+    """
+    if n <= 0:
+        return [], {}
+    rng = random.Random(seed)
+    by_vol = sorted(groups, key=lambda g: g[2])
+    if not by_vol:
+        return [], {}
+    n_groups = len(by_vol)
+    vol_quartile_edges = [
+        by_vol[max(0, n_groups * q // 4 - 1)][2] for q in range(1, 5)
+    ]
+
+    def vol_bin(v: int) -> int:
+        for i, edge in enumerate(vol_quartile_edges):
+            if v <= edge:
+                return i
+        return 3
+
+    has_contrast = (
+        contrast_by_key is not None
+        and sum(1 for k, _, _ in by_vol if k in contrast_by_key) >= n_groups - 2
+    )
+    if has_contrast:
+        contrasts = sorted(contrast_by_key[k] for k, _, _ in by_vol if k in contrast_by_key)
+        cmedian = contrasts[len(contrasts) // 2]
+    else:
+        cmedian = None
+
+    cells: dict[tuple[int, int], list[tuple[str, list[str], int]]] = defaultdict(list)
+    for g in by_vol:
+        key = g[0]
+        vb = vol_bin(g[2])
+        if cmedian is not None and key in contrast_by_key:
+            cb = 0 if contrast_by_key[key] <= cmedian else 1
+        else:
+            cb = 0
+        cells[(vb, cb)].append(g)
+
+    cell_order = sorted(cells.keys())
+    picked: list[str] = []
+    picked_set: set[str] = set()
+    pool: dict[tuple[int, int], list[tuple[str, list[str], int]]] = {
+        c: list(rng.sample(cells[c], len(cells[c]))) for c in cell_order
+    }
+    while len(picked) < n:
+        progress = False
+        for c in cell_order:
+            if not pool[c]:
+                continue
+            g = pool[c].pop()
+            if g[0] in picked_set:
+                continue
+            picked.append(g[0])
+            picked_set.add(g[0])
+            progress = True
+            if len(picked) >= n:
+                break
+        if not progress:
+            break
+
+    recipe = {
+        "n_requested": n,
+        "n_groups_total": n_groups,
+        "vol_quartile_edges": vol_quartile_edges,
+        "contrast_median": cmedian,
+        "stratified_by": "vol_quartile x contrast_bin" if has_contrast else "vol_quartile",
+        "seed": seed,
+        "picked": picked,
+    }
+    return picked, recipe
+
+
 def build_splits(folds: list[list[str]]) -> list[dict]:
     """Convert per-fold validation lists into nnU-Net's 5-fold split schema."""
     all_cases = sorted({c for f in folds for c in f})
@@ -125,6 +246,34 @@ def main() -> int:
         "--dry-run",
         action="store_true",
         help="Print the folds but do not write splits_final.json.",
+    )
+    parser.add_argument(
+        "--write-holdout",
+        type=str,
+        default=None,
+        help="Path to write a stratified holdout list (one patient key per line). "
+             "When set, the script picks --n holdout cases instead of writing "
+             "splits_final.json.",
+    )
+    parser.add_argument(
+        "--n",
+        type=int,
+        default=7,
+        help="Holdout size for --write-holdout (default 7).",
+    )
+    parser.add_argument(
+        "--contrast-csv",
+        type=str,
+        default=None,
+        help="Optional CSV (columns: case,contrast) used to refine the "
+             "stratification with a low/high contrast bin per volume "
+             "quartile.",
+    )
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=20260507,
+        help="Seed for --write-holdout (default 20260507 = 2026-05-07).",
     )
     args = parser.parse_args()
 
@@ -168,6 +317,48 @@ def main() -> int:
         f"median={int(np.median(strat_volumes))}, max={strat_volumes.max()}, "
         f"factor={strat_volumes.max()/max(strat_volumes.min(),1):.1f}x"
     )
+
+    if args.write_holdout:
+        contrast_by_key: dict[str, float] | None = None
+        if args.contrast_csv:
+            cpath = Path(args.contrast_csv)
+            if not cpath.is_file():
+                raise SystemExit(f"--contrast-csv not found: {cpath}")
+            contrast_by_key = _load_contrast_csv(cpath)
+            print(
+                f"[holdout] loaded contrast for {len(contrast_by_key)} cases "
+                f"from {cpath}"
+            )
+        picked, recipe = pick_stratified_holdout(
+            groups,
+            n=args.n,
+            contrast_by_key=contrast_by_key,
+            seed=args.seed,
+        )
+        if not picked:
+            raise SystemExit("[holdout] no cases picked (empty groups)")
+        out_path = Path(args.write_holdout)
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        ts = _dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        with open(out_path, "w") as fh:
+            fh.write(f"# stratified holdout — generated {ts}\n")
+            fh.write(f"# script: scripts/make_stratified_splits.py --write-holdout\n")
+            fh.write(f"# dataset: {ds_name}\n")
+            fh.write(f"# n_requested: {recipe['n_requested']}\n")
+            fh.write(f"# n_groups_total: {recipe['n_groups_total']}\n")
+            fh.write(f"# stratified_by: {recipe['stratified_by']}\n")
+            fh.write(f"# vol_quartile_edges (vox): {recipe['vol_quartile_edges']}\n")
+            if recipe['contrast_median'] is not None:
+                fh.write(f"# contrast_median: {recipe['contrast_median']}\n")
+            fh.write(f"# seed: {recipe['seed']}\n")
+            fh.write("# one patient key per line (excluded from train + held out for unseen test)\n")
+            for k in picked:
+                fh.write(f"{k}\n")
+        print(f"[holdout] wrote {len(picked)} ids -> {out_path}")
+        vmax_by_key = {key: vmax for key, _, vmax in groups}
+        for k in picked:
+            print(f"  {k}: vol_max={vmax_by_key.get(k, 'n/a')}")
+        return 0
 
     folds = stratified_folds_from_groups(groups, args.n_folds)
     print(f"[splits] {args.n_folds} folds (validation cases per fold):")

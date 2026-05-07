@@ -11,6 +11,27 @@ Lipomatosos Atípicos).
 - **§8**: plan de Semana 2, experimentos priorizados y estado del
   código. Punto de partida para retomar el trabajo.
 
+## TL;DR — 2026-05-07: nuevo baseline operativo (Dataset503)
+
+Sobre `Dataset503_ALT_T1T2` (GT = `union_v2`, 5-fold CV, n=46 pacientes), el
+ganador del CSV `reports/per_case_baseline_and_mixed.csv` es
+**`fusion_union_v2_503_gated_v2c`**:
+
+- mean Dice **0.8032**, global Dice **0.8815**
+- zeros: 1/46 (`IOG45`); lows (<0.5): `IOG1` (0.017), `IOG31` (0.004)
+- vs DA5 3D (0.637 mean): **+0.166 Dice**
+
+Próximos pasos (detalle en §9.8.3 → "Update 2026-05-07"):
+
+1. **Holdout estratificado real** (vol × contraste, n=7) — primer test de
+   generalización honesto. Default-on en `run_training.sh` cuando
+   `holdout_cases.txt` existe.
+2. **Auditoría T2 + clipping diagnóstico** (sin implementar todavía:
+   `reports/t2_intensity_audit.csv`).
+3. **v2c gated por defecto en CV** (`RUN_CV_GATED=1`).
+4. **Limpieza de inconsistencias** (path roto en docstring, EPOCHS=500
+   inválido para INV/INVGAMMA, script duplicado en `reports/`).
+
 ## TL;DR — Semanas 1–2: cierre de pretrain y gate sigmoide
 
 
@@ -2333,6 +2354,76 @@ pero puede **sobre-castigar** casos donde el 3D multichannel ya estaba bien
 (IOG36/48) o donde el 2D colapsa (IOG1).
 
 #### 9.8.3 Próximos pasos propuestos
+
+##### Update 2026-05-07 — baseline reafirmado + próximos pasos
+
+Fuente de verdad: `reports/per_case_baseline_and_mixed.csv` (regenerado).
+Baseline = **`fusion_union_v2_503_gated_v2c`** (mean **0.8032**, global
+**0.8815**, n=46). Reordenamos los próximos pasos para esta semana:
+
+1. **Holdout estratificado real** (vol × contraste, n=7) — bloquea CV+test
+   por primera vez. Helper nuevo
+   `scripts/make_stratified_splits.py::pick_stratified_holdout`,
+   re-rolla `holdout_cases.txt`. Default-on en `run_training.sh` cuando el
+   archivo existe; `RUN_HOLDOUT_EVAL` también default-on en ese caso.
+   Hasta hoy entrenábamos sobre los 46 pacientes y el "test" era CV — sin
+   estimación honesta de generalización a casos nunca vistos.
+2. **Auditoría T2 + clipping diagnóstico** *(corrida 2026-05-07)*. Outputs:
+   `reports/t2_intensity_audit.csv` y `reports/t1_intensity_audit.csv`
+   (n=46 cada uno, generados con
+   `python scripts/case_contrast_stats.py --raw-modality {T1|T2} --all --csv ...`,
+   leen DIRECTAMENTE de `T1/IOG*/` y `T2/IOG*/` antes de
+   `_fix_intensity`).
+
+   Hallazgos:
+
+   - **Wraparound int16 (`img_min<0`)**: `IOG47` en T1 *y* en T2
+     (mismo paciente, mismo bug DICOM/NIfTI). `_fix_intensity` ya cubre
+     ambos: T1 vía `convert_to_nnunet.py:253`; T2 vía
+     `build_t1t2_dataset.py:347`. **Sin acción adicional.**
+   - **Tail derecha pesada (cases que tocan `max=4095` por clamping
+     uint12 del scanner)**: T2 tiene 6 casos en el ceiling (IOG6, IOG9,
+     IOG31, IOG35, IOG40, IOG43); T1 tiene 2 (IOG6, IOG9). Ratio
+     `max/p999` peor en T2 (IOG9: 4.03×; IOG6: 2.92×) vs T1 (IOG9:
+     3.14×). Implicación: el `max` es artefacto, no señal. Clipping a
+     `p99.5` recortaría 47–85 % del rango aparente en los 10 peores
+     casos T2 (IOG9: 85.4 %, IOG6: 78.7 %, IOG39: 52.5 %, IOG40: 50.9 %).
+     T1 tiene rangos parecidos (IOG9: 79.6 %, IOG19: 72.3 %), por lo
+     que el clipping aplicaría igualmente bien a *ambas* modalidades.
+   - **Contraste atípico (`snr_brain<0`)**: T2 sólo tiene IOG9
+     (snr=−0.62); T1 tiene 5 (IOG21, IOG48, IOG55, IOG40, IOG33). La
+     rama InvertImage/InvertGamma que se exploró para T1 (Exp. 2b /
+     2b') no es necesaria en T2.
+
+   Decisión recomendada (a confirmar y ejecutar en el siguiente chat):
+
+   1. Añadir `_clip_percentiles(img, p_lo=0.5, p_hi=99.5)` en
+      `scripts/convert_to_nnunet.py` después de `_fix_intensity`, gated
+      por una flag opt-in (`--percentile-clip` o env var). Aplicar a
+      *ambos* modos (T1, T2) — la evidencia muestra que ambos tienen
+      tails pesadas, no solo T2.
+   2. A/B test: `Dataset504_ALT_T1T2_clip` (nuevo dataset id para no
+      clobberar el cache preprocesado del baseline) entrenado con la
+      misma receta que el ganador actual
+      (`fusion_union_v2_503_gated_v2c`), 1 fold primero, full 5-fold
+      sólo si mejora ≥ +0.005 mean Dice.
+3. **v2c gated por defecto en CV** — nueva env var `RUN_CV_GATED=1` (default
+   on) corre `scripts/ensemble_gated.py --gate-mode sigmoid
+   --use-confidence --tau 20 --min-fg-voxels 1000` después de
+   `nnUNetv2_find_best_configuration` para datasets non-multichannel
+   (501, 502). Hasta hoy el gating solo corría en el bloque de holdout.
+4. **Limpieza de inconsistencias**:
+   - Docstring de `run_training.sh` apuntaba a
+     `config/holdout_cases.example.txt` (no existe). Corregido a
+     `holdout_cases.txt`.
+   - Validación `EPOCHS=500` para `ALT_OS033_INV` / `ALT_OS033_INVGAMMA`
+     era falsa promesa: las clases de 500 épocas nunca se escribieron en
+     `custom_trainers/nnUNetTrainerALT_inv.py`. Restringido a 250.
+   - Script duplicado `reports/build_per_case_baseline_and_mixed.py`
+     (mismo rol que `scripts/update_per_case_baseline_and_mixed.py`)
+     eliminado; `reports/README.md` apunta al canónico.
+
+#### 9.8.3.legacy — orden viejo (pre-2026-05-07)
 
 En orden de costo/beneficio:
 
